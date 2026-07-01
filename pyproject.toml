@@ -1,0 +1,22 @@
+[project]
+name = "deep-hedging-jax"
+version = "0.1.0"
+description = "JAX reproduction of the Deep Hedging Black--Scholes and Heston experiments"
+requires-python = ">=3.11"
+dependencies = [
+  "chex>=0.1.88",
+  "equinox>=0.11.10",
+  "jax>=0.4.35",
+  "matplotlib>=3.9",
+  "numpy>=2.0",
+  "optax>=0.2.4",
+  "tyro>=0.9.13",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["."]
+
