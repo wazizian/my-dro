@@ -14,8 +14,11 @@ from deep_hedging import (
     Config,
     MarketConfig,
     StrategyConfig,
+    decode_trajectory,
+    encode_trajectory,
     hedging_loss,
     initialize_strategy,
+    make_robust_steps,
     make_steps,
     market_dimensions,
     save_artifacts,
@@ -23,6 +26,7 @@ from deep_hedging import (
     simulate_heston,
     strategy_apply,
 )
+from wdro import RobustConfig, RobustState
 
 
 def test_black_scholes_shape_positive_and_deterministic():
@@ -58,6 +62,28 @@ def test_heston_shapes_finiteness_and_terminal_swap(dtype):
     dt = config.horizon / config.n_time
     accumulated = jnp.sum(variance[:, :-1] * dt, axis=1)
     np.testing.assert_allclose(prices[:, -1, 1], accumulated, rtol=2e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("name", ["black_scholes", "heston"])
+def test_market_trajectory_coordinates_round_trip(name):
+    """Verify both markets encode and decode into the same valid prices, features, and variance."""
+
+    market = MarketConfig(name=name, n_time=3, horizon=3 / 365)
+    prices, features, variance = (
+        (*simulate_black_scholes(jax.random.PRNGKey(22), market, 8), None)
+        if name == "black_scholes"
+        else simulate_heston(jax.random.PRNGKey(22), market, 8)
+    )
+    coordinates = encode_trajectory(prices, variance, market)
+    expected_dimension = market.n_time if name == "black_scholes" else 2 * market.n_time
+    chex.assert_shape(coordinates, (8, expected_dimension))
+    decoded_prices, decoded_features, decoded_variance = decode_trajectory(coordinates, market)
+    np.testing.assert_allclose(decoded_prices, prices, rtol=3e-5, atol=1e-7)
+    np.testing.assert_allclose(decoded_features, features, rtol=3e-5, atol=1e-7)
+    assert bool(jnp.all(decoded_prices[:, :, 0] > 0.0))
+    if variance is not None:
+        np.testing.assert_allclose(decoded_variance, variance, rtol=3e-5, atol=1e-7)
+        assert bool(jnp.all(decoded_variance > 0.0))
 
 
 def test_strategy_widths_output_and_batch_norm_modes():
@@ -165,6 +191,45 @@ def test_jitted_optimizer_step_is_finite_and_updates_parameters():
     assert any(not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(strategy), jax.tree.leaves(updated)))
 
 
+@pytest.mark.parametrize("name", ["black_scholes", "heston"])
+@pytest.mark.parametrize("objective", ["entropic", "joint_cvar"])
+def test_jitted_robust_optimizer_step_is_finite(name, objective):
+    """Verify both WDRO objectives compile and update model/dual state for both supported markets."""
+
+    market = MarketConfig(name=name, n_time=2, horizon=2 / 365)
+    strategy = initialize_strategy(jax.random.PRNGKey(23), market)
+    dimension = market.n_time if name == "black_scholes" else 2 * market.n_time
+    robust_state = RobustState(
+        jnp.asarray(0.0), jnp.asarray(0.0), jnp.zeros((dimension,)), jnp.ones((dimension,)))
+    robust_config = RobustConfig(enabled=True, objective=objective, proposal_samples=2,
+                                 proposal_scale=0.01, ula_steps=0)
+    prices, _, variance = (
+        (*simulate_black_scholes(jax.random.PRNGKey(24), market, 4), None)
+        if name == "black_scholes"
+        else simulate_heston(jax.random.PRNGKey(24), market, 4)
+    )
+    optimizer = optax.adam(0.001)
+    parameters = (strategy, robust_state)
+    state = optimizer.init(eqx.filter(parameters, eqx.is_array))
+    step, _ = make_robust_steps(optimizer, market, StrategyConfig(), robust_config, 0.0)
+    updated_strategy, updated_robust, _, loss, norm = step(
+        strategy, robust_state, state, prices, variance, jax.random.PRNGKey(25))
+    chex.assert_shape(loss, ())
+    chex.assert_shape(norm, ())
+    chex.assert_shape(updated_robust.raw_lambda, ())
+    chex.assert_shape(updated_robust.eta, ())
+    assert bool(jnp.isfinite(loss))
+    assert bool(jnp.isfinite(norm))
+    np.testing.assert_array_equal(updated_strategy.cash, strategy.cash)
+    np.testing.assert_array_equal(updated_strategy.q, strategy.q)
+    np.testing.assert_array_equal(updated_robust.location, robust_state.location)
+    np.testing.assert_array_equal(updated_robust.scale, robust_state.scale)
+    if objective == "entropic":
+        np.testing.assert_array_equal(updated_robust.eta, robust_state.eta)
+    assert any(not np.array_equal(a, b) for a, b in zip(
+        jax.tree.leaves(strategy), jax.tree.leaves(updated_strategy)))
+
+
 def test_short_fixed_batch_training_reduces_loss():
     """Verify fixed validation CVaR falls after training on a separate fixed batch."""
 
@@ -204,4 +269,28 @@ def test_artifacts_and_checkpoint_round_trip(tmp_path):
     assert expected.issubset({path.name for path in directory.iterdir()})
     restored = eqx.tree_deserialise_leaves(directory / "model.eqx", strategy)
     for original, loaded in zip(jax.tree.leaves(strategy), jax.tree.leaves(restored)):
+        np.testing.assert_array_equal(original, loaded)
+
+
+def test_robust_artifacts_and_dual_checkpoint_round_trip(tmp_path):
+    """Verify robust runs save their scalar dual variables and fixed coordinate statistics."""
+
+    market = MarketConfig(name="heston", n_time=2, horizon=2 / 365)
+    robust_config = RobustConfig(enabled=True, objective="joint_cvar", ula_steps=1)
+    config = Config(market=market, robust=robust_config)
+    config.evaluation.output_dir = str(tmp_path)
+    strategy = initialize_strategy(jax.random.PRNGKey(26), market)
+    robust_state = RobustState(
+        jnp.asarray(0.2), jnp.asarray(0.3), jnp.zeros((4,)), jnp.ones((4,)))
+    history = {"step": [0], "train_loss": [1.0], "validation_loss": [1.1],
+               "grad_norm": [0.5], "lambda": [0.8], "eta": [0.3]}
+    metrics = {"mse": 1.2, "cvar": 1.5, "robust_objective": 1.7, "lambda": 0.8,
+               "eta": 0.3, "cash": 1.7, "error_mean": 0.0, "error_std": 1.0,
+               "error_quantiles": [0.0] * 5, "mean_cost": 0.0, "mean_turnover": 0.0,
+               "mean_holdings": [[0.0, 0.0], [0.0, 0.0]],
+               "mean_turnover_by_date": [0.0, 0.0], "errors": [0.0, 1.0]}
+    directory = save_artifacts(strategy, history, metrics, config, robust_state)
+    assert (directory / "robust.eqx").exists()
+    restored = eqx.tree_deserialise_leaves(directory / "robust.eqx", robust_state)
+    for original, loaded in zip(jax.tree.leaves(robust_state), jax.tree.leaves(restored)):
         np.testing.assert_array_equal(original, loaded)

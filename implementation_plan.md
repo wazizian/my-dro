@@ -9,7 +9,7 @@ Implement the Deep Hedging experiment from Buehler et al. for an at-the-money Eu
 3. Heston without transaction costs.
 4. Heston with proportional transaction costs.
 
-Use JAX, Equinox, Optax, Chex, Tyro, and `uv`. The implementation uses CVaR, the paper's simplest reported risk criterion. Robust/DRO training is outside this first implementation.
+Use JAX, Equinox, Optax, Chex, Tyro, and `uv`. The nominal implementation uses CVaR, the paper's simplest reported risk criterion. The entropic and joint-CVaR WDRO extension is specified in `wdro_implementation_plan.md`.
 
 ## 2. Mathematical objective
 

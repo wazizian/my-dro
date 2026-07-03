@@ -1,0 +1,217 @@
+"""Regularized WDRO dual objectives and ULA importance proposals."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Literal
+
+import chex
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+
+Array = jax.Array
+
+
+@chex.dataclass
+class RobustConfig:
+    """Configure a WDRO dual and proposal; inputs are scalar hyperparameters."""
+
+    enabled: bool = False
+    objective: Literal["entropic", "joint_cvar"] = "entropic"
+    rho: float = 0.1
+    kl_epsilon: float = 0.1
+    tau: float = 0.0
+    alpha: float = 0.95
+    proposal_samples: int = 32
+    proposal_scale: float = 0.1
+    ula_steps: int = 0
+    ula_step_size: float = 0.01
+    ula_gradient_clip: float = 10.0
+    initial_lambda: float = 1.0
+    initial_eta: float = 0.0
+
+
+class RobustState(eqx.Module):
+    """Store dual variables and fixed trajectory standardization statistics."""
+
+    raw_lambda: Array
+    eta: Array
+    location: Array
+    scale: Array
+
+
+def gaussian_log_density(value: Array, mean: Array, variance: Array) -> Array:
+    """Evaluate isotropic Gaussian log densities; inputs share shape (..., dimension), output is (...)."""
+
+    chex.assert_equal_shape((value, mean))
+    dimension = value.shape[-1]
+    chex.assert_shape(variance, ())
+    difference = value - mean
+    chex.assert_shape(difference, value.shape)
+    squared_distance = jnp.sum(jnp.square(difference), axis=-1)
+    chex.assert_shape(squared_distance, value.shape[:-1])
+    normalization = dimension * jnp.log(2.0 * jnp.pi * variance)
+    chex.assert_shape(normalization, ())
+    log_density = -0.5 * (squared_distance / variance + normalization)
+    chex.assert_shape(log_density, value.shape[:-1])
+    return log_density
+
+
+def quadratic_transport_cost(samples: Array, anchors: Array, reference_scale: Array) -> Array:
+    """Compute Gaussian-reference transport cost; inputs are proposed/base coordinates/scale, output is (batch, proposals)."""
+
+    batch, n_proposals, dimension = samples.shape
+    chex.assert_shape(anchors, (batch, dimension))
+    chex.assert_shape(reference_scale, ())
+    differences = (samples - anchors[:, None, :]) / reference_scale
+    chex.assert_shape(differences, (batch, n_proposals, dimension))
+    costs = 0.5 * jnp.sum(jnp.square(differences), axis=2)
+    chex.assert_shape(costs, (batch, n_proposals))
+    return costs
+
+
+def sample_langevin_proposal(
+    key: Array,
+    anchors: Array,
+    log_target: Callable[[Array, Array], Array],
+    config: RobustConfig,
+) -> tuple[Array, Array]:
+    """Sample a reference/ULA proposal; inputs are key, anchors, target, config and outputs samples/log weights."""
+
+    batch, dimension = anchors.shape
+    n_proposals = config.proposal_samples
+    n_steps = config.ula_steps
+    if n_steps < 0:
+        raise ValueError("ula_steps must be nonnegative")
+    if (config.proposal_scale <= 0.0 or config.ula_step_size <= 0.0
+            or config.ula_gradient_clip <= 0.0):
+        raise ValueError("proposal scale, ULA step size, and gradient clip must be positive")
+    keys = jax.random.split(key, n_steps + 1)
+    chex.assert_shape(keys, (n_steps + 1, 2))
+    initial_noise = jax.random.normal(keys[0], (batch, n_proposals, dimension), dtype=anchors.dtype)
+    chex.assert_shape(initial_noise, (batch, n_proposals, dimension))
+    initial = anchors[:, None, :] + config.proposal_scale * initial_noise
+    chex.assert_shape(initial, (batch, n_proposals, dimension))
+    if n_steps == 0:
+        log_weights = jnp.zeros((batch, n_proposals), dtype=anchors.dtype)
+        chex.assert_shape(log_weights, (batch, n_proposals))
+        samples = jax.lax.stop_gradient(initial)
+        chex.assert_shape(samples, (batch, n_proposals, dimension))
+        return samples, log_weights
+
+    flat_anchors = jnp.repeat(anchors, n_proposals, axis=0)
+    chex.assert_shape(flat_anchors, (batch * n_proposals, dimension))
+    gradient_one = jax.grad(log_target, argnums=1)
+
+    def ula_step(current: Array, step_key: Array) -> tuple[Array, tuple[Array, Array]]:
+        """Advance one ULA step; inputs are current particles/key, outputs next particles/transition data."""
+
+        chex.assert_shape(current, (batch, n_proposals, dimension))
+        flat_current = current.reshape(batch * n_proposals, dimension)
+        chex.assert_shape(flat_current, (batch * n_proposals, dimension))
+        flat_gradient = jax.vmap(gradient_one)(flat_anchors, flat_current)
+        chex.assert_shape(flat_gradient, (batch * n_proposals, dimension))
+        gradient = flat_gradient.reshape(batch, n_proposals, dimension)
+        chex.assert_shape(gradient, (batch, n_proposals, dimension))
+        gradient_norm = jnp.linalg.norm(gradient, axis=2, keepdims=True)
+        chex.assert_shape(gradient_norm, (batch, n_proposals, 1))
+        gradient_factor = jnp.minimum(
+            1.0, config.ula_gradient_clip / jnp.maximum(gradient_norm, 1e-12))
+        chex.assert_shape(gradient_factor, (batch, n_proposals, 1))
+        gradient = gradient * gradient_factor
+        chex.assert_shape(gradient, (batch, n_proposals, dimension))
+        transition_mean = current + 0.5 * config.ula_step_size * gradient
+        chex.assert_shape(transition_mean, (batch, n_proposals, dimension))
+        noise = jax.random.normal(step_key, current.shape, dtype=current.dtype)
+        chex.assert_shape(noise, (batch, n_proposals, dimension))
+        following = transition_mean + jnp.sqrt(config.ula_step_size) * noise
+        chex.assert_shape(following, (batch, n_proposals, dimension))
+        return following, (current, transition_mean)
+
+    final, (previous_history, mean_history) = jax.lax.scan(ula_step, initial, keys[1:])
+    chex.assert_shape(final, (batch, n_proposals, dimension))
+    chex.assert_shape(previous_history, (n_steps, batch, n_proposals, dimension))
+    chex.assert_shape(mean_history, (n_steps, batch, n_proposals, dimension))
+    final_mean = mean_history[-1]
+    chex.assert_shape(final_mean, (batch, n_proposals, dimension))
+    reference_mean = jnp.broadcast_to(anchors[:, None, :], final.shape)
+    chex.assert_shape(reference_mean, (batch, n_proposals, dimension))
+    reference_variance = jnp.asarray(config.proposal_scale**2, dtype=anchors.dtype)
+    chex.assert_shape(reference_variance, ())
+    transition_variance = jnp.asarray(config.ula_step_size, dtype=anchors.dtype)
+    chex.assert_shape(transition_variance, ())
+    log_reference = gaussian_log_density(final, reference_mean, reference_variance)
+    chex.assert_shape(log_reference, (batch, n_proposals))
+    log_transition = gaussian_log_density(final, final_mean, transition_variance)
+    chex.assert_shape(log_transition, (batch, n_proposals))
+    log_weights = log_reference - log_transition
+    chex.assert_shape(log_weights, (batch, n_proposals))
+    samples = jax.lax.stop_gradient(final)
+    chex.assert_shape(samples, (batch, n_proposals, dimension))
+    log_weights = jax.lax.stop_gradient(log_weights)
+    chex.assert_shape(log_weights, (batch, n_proposals))
+    return samples, log_weights
+
+
+def entropic_dual(
+    state: RobustState,
+    pathwise_loss: Array,
+    transport_cost: Array,
+    log_weights: Array,
+    config: RobustConfig,
+) -> Array:
+    """Compute the entropic WDRO dual; inputs are state/path arrays/config and output is a scalar objective."""
+
+    chex.assert_equal_shape((pathwise_loss, transport_cost, log_weights))
+    batch, n_proposals = pathwise_loss.shape
+    chex.assert_shape(state.raw_lambda, ())
+    lambda_ = jax.nn.softplus(state.raw_lambda)
+    chex.assert_shape(lambda_, ())
+    temperature = config.kl_epsilon + lambda_ * config.tau
+    chex.assert_shape(temperature, ())
+    penalized = pathwise_loss - lambda_ * transport_cost
+    chex.assert_shape(penalized, (batch, n_proposals))
+    scores = penalized / temperature + log_weights
+    chex.assert_shape(scores, (batch, n_proposals))
+    inner = jax.scipy.special.logsumexp(scores, axis=1) - jnp.log(n_proposals)
+    chex.assert_shape(inner, (batch,))
+    objective = lambda_ * config.rho + temperature * jnp.mean(inner)
+    chex.assert_shape(objective, ())
+    return objective
+
+
+def joint_cvar_dual(
+    state: RobustState,
+    pathwise_loss: Array,
+    transport_cost: Array,
+    log_weights: Array,
+    config: RobustConfig,
+) -> Array:
+    """Compute the joint-CVaR WDRO dual; inputs are state/path arrays/config and output is a scalar objective."""
+
+    chex.assert_equal_shape((pathwise_loss, transport_cost, log_weights))
+    batch, n_proposals = pathwise_loss.shape
+    chex.assert_shape(state.raw_lambda, ())
+    chex.assert_shape(state.eta, ())
+    lambda_ = jax.nn.softplus(state.raw_lambda)
+    chex.assert_shape(lambda_, ())
+    penalized = pathwise_loss - lambda_ * transport_cost
+    chex.assert_shape(penalized, (batch, n_proposals))
+    tail = jax.nn.relu(penalized - state.eta)
+    chex.assert_shape(tail, (batch, n_proposals))
+    safe_tail = jnp.maximum(tail, jnp.finfo(tail.dtype).tiny)
+    chex.assert_shape(safe_tail, (batch, n_proposals))
+    log_tail = jnp.where(tail > 0.0, jnp.log(safe_tail), -jnp.inf)
+    chex.assert_shape(log_tail, (batch, n_proposals))
+    log_weighted_tail = log_weights + log_tail
+    chex.assert_shape(log_weighted_tail, (batch, n_proposals))
+    log_tail_mean = (jax.scipy.special.logsumexp(log_weighted_tail)
+                     - jnp.log(batch * n_proposals))
+    chex.assert_shape(log_tail_mean, ())
+    weighted_tail_mean = jnp.where(
+        jnp.all(tail == 0.0), 0.0, jnp.exp(log_tail_mean))
+    chex.assert_shape(weighted_tail_mean, ())
+    objective = lambda_ * config.rho + state.eta + weighted_tail_mean / (1.0 - config.alpha)
+    chex.assert_shape(objective, ())
+    return objective

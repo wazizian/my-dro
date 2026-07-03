@@ -33,6 +33,28 @@ The optional paper cost grid is `0.015625, 0.0078125, 0.00390625, 0.001953125,
 0.0009765625`; run the desired market once per value with `--epsilon VALUE`.
 The tail level can be changed with `--alpha VALUE` (default 0.95).
 
+## WDRO training
+
+Two regularized WDRO duals are available: `entropic` and `joint_cvar`. The
+joint-CVaR formulation uses one global scalar threshold. It does not implement
+the conditional formulation with one threshold per base trajectory.
+
+```bash
+uv run python deep_hedging.py --robust.enabled --robust.objective entropic
+uv run python deep_hedging.py --robust.enabled --robust.objective joint_cvar
+```
+
+The conditional reference kernel is Gaussian in standardized trajectory
+coordinates. Set `--robust.ula-steps 0`, `1`, or `2` to use the reference
+proposal or an augmented-space ULA proposal. For `k > 0`, importance weights
+use the explicit final Gaussian transition density; the intractable endpoint
+marginal is not evaluated. The default ULA step variance equals the default
+reference variance (`0.01 = 0.1²`); when changing the proposal scale, start by
+setting `--robust.ula-step-size` to its square.
+
+Robust runs save their dual state, including fixed coordinate statistics, in
+`robust.eqx` and append results to `outputs/robust_comparison.csv`.
+
 Each run writes its configuration, metrics, training history, Equinox checkpoint,
 loss curve, hedging-error histogram, holdings plot, and turnover plot below
 `outputs/`. The Black--Scholes no-cost case also writes an analytic-delta

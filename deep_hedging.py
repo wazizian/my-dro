@@ -16,6 +16,15 @@ import numpy as np
 import optax
 import tyro
 
+from wdro import (
+    RobustConfig,
+    RobustState,
+    entropic_dual,
+    joint_cvar_dual,
+    quadratic_transport_cost,
+    sample_langevin_proposal,
+)
+
 Array = jax.Array
 
 
@@ -76,6 +85,7 @@ class Config:
     strategy: StrategyConfig = dataclasses.field(default_factory=StrategyConfig)
     training: TrainingConfig = dataclasses.field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = dataclasses.field(default_factory=EvaluationConfig)
+    robust: RobustConfig = dataclasses.field(default_factory=RobustConfig)
     epsilon: float = 0.0
     alpha: float = 0.95
 
@@ -263,6 +273,89 @@ def simulate_market(key: Array, config: MarketConfig, batch: int) -> tuple[Array
     return simulate_heston(key, config, batch)
 
 
+def encode_trajectory(prices: Array, variance: Array | None, config: MarketConfig) -> Array:
+    """Encode valid market paths as Euclidean coordinates; inputs are paths/variance/config, output is coordinates."""
+
+    batch, n_points, n_assets = prices.shape
+    n_time = n_points - 1
+    expected_assets, _ = market_dimensions(config)
+    chex.assert_shape(prices, (batch, n_time + 1, expected_assets))
+    log_stock = jnp.log(prices[:, 1:, 0])
+    chex.assert_shape(log_stock, (batch, n_time))
+    if config.name == "black_scholes":
+        coordinates = log_stock
+        chex.assert_shape(coordinates, (batch, n_time))
+        return coordinates
+    if variance is None:
+        raise ValueError("Heston trajectory encoding requires variance paths")
+    chex.assert_shape(variance, (batch, n_time + 1))
+    variance_floor = jnp.asarray(1e-12, dtype=variance.dtype)
+    chex.assert_shape(variance_floor, ())
+    positive_variance = jnp.maximum(variance[:, 1:], variance_floor)
+    chex.assert_shape(positive_variance, (batch, n_time))
+    log_variance = jnp.log(positive_variance)
+    chex.assert_shape(log_variance, (batch, n_time))
+    coordinates = jnp.concatenate((log_stock, log_variance), axis=1)
+    chex.assert_shape(coordinates, (batch, 2 * n_time))
+    return coordinates
+
+
+def decode_trajectory(coordinates: Array, config: MarketConfig) -> tuple[Array, Array, Array | None]:
+    """Decode Euclidean coordinates into valid market paths; inputs are coordinates/config, outputs paths/features/variance."""
+
+    batch, dimension = coordinates.shape
+    n_time = config.n_time
+    dtype = coordinates.dtype
+    log_initial = jnp.full((batch, 1), jnp.log(config.spot), dtype=dtype)
+    chex.assert_shape(log_initial, (batch, 1))
+    if config.name == "black_scholes":
+        chex.assert_shape(coordinates, (batch, n_time))
+        logs = jnp.concatenate((log_initial, coordinates), axis=1)
+        chex.assert_shape(logs, (batch, n_time + 1))
+        stock = jnp.exp(logs)[:, :, None]
+        chex.assert_shape(stock, (batch, n_time + 1, 1))
+        features = logs[:, :-1, None]
+        chex.assert_shape(features, (batch, n_time, 1))
+        return stock, features, None
+    chex.assert_shape(coordinates, (batch, 2 * n_time))
+    log_stock_tail = coordinates[:, :n_time]
+    chex.assert_shape(log_stock_tail, (batch, n_time))
+    log_variance_tail = coordinates[:, n_time:]
+    chex.assert_shape(log_variance_tail, (batch, n_time))
+    logs = jnp.concatenate((log_initial, log_stock_tail), axis=1)
+    chex.assert_shape(logs, (batch, n_time + 1))
+    initial_variance = jnp.full((batch, 1), config.initial_variance, dtype=dtype)
+    chex.assert_shape(initial_variance, (batch, 1))
+    variance_tail = jnp.exp(log_variance_tail)
+    chex.assert_shape(variance_tail, (batch, n_time))
+    variance = jnp.concatenate((initial_variance, variance_tail), axis=1)
+    chex.assert_shape(variance, (batch, n_time + 1))
+    dt = jnp.asarray(config.horizon / n_time, dtype=dtype)
+    chex.assert_shape(dt, ())
+    interval_variance = variance[:, :-1] * dt
+    chex.assert_shape(interval_variance, (batch, n_time))
+    integrated_tail = jnp.cumsum(interval_variance, axis=1)
+    chex.assert_shape(integrated_tail, (batch, n_time))
+    integrated = jnp.concatenate((jnp.zeros((batch, 1), dtype=dtype), integrated_tail), axis=1)
+    chex.assert_shape(integrated, (batch, n_time + 1))
+    times = jnp.linspace(0.0, config.horizon, n_time + 1, dtype=dtype)
+    chex.assert_shape(times, (n_time + 1,))
+    remaining = config.horizon - times[None, :]
+    chex.assert_shape(remaining, (1, n_time + 1))
+    adjustment = ((variance - config.long_variance) / config.kappa) * (
+        1.0 - jnp.exp(-config.kappa * remaining)) + config.long_variance * remaining
+    chex.assert_shape(adjustment, (batch, n_time + 1))
+    variance_swap = integrated + adjustment
+    chex.assert_shape(variance_swap, (batch, n_time + 1))
+    stock = jnp.exp(logs)
+    chex.assert_shape(stock, (batch, n_time + 1))
+    prices = jnp.stack((stock, variance_swap), axis=-1)
+    chex.assert_shape(prices, (batch, n_time + 1, 2))
+    features = jnp.stack((logs[:, :-1], variance[:, :-1]), axis=-1)
+    chex.assert_shape(features, (batch, n_time, 2))
+    return prices, features, variance
+
+
 def strategy_apply(strategy: Strategy, features: Array, config: StrategyConfig, training: bool) -> tuple[Array, Strategy]:
     """Scan the semi-recurrent policy; inputs are parameters/features/mode, outputs holdings/new BN state."""
 
@@ -336,10 +429,10 @@ def strategy_apply(strategy: Strategy, features: Array, config: StrategyConfig, 
     return holdings, new_strategy
 
 
-def hedging_loss(strategy: Strategy, prices: Array, features: Array, epsilon: float,
-                 strategy_config: StrategyConfig, training: bool, alpha: float = 0.95,
-                 strike: float = 100.0) -> tuple[Array, tuple[Array, ...], Strategy]:
-    """Compute CVaR and accounting; inputs policy/paths/cost/mode, outputs loss, diagnostics, BN state."""
+def pathwise_hedging_loss(strategy: Strategy, prices: Array, features: Array, epsilon: float,
+                          strategy_config: StrategyConfig, training: bool,
+                          strike: float = 100.0) -> tuple[Array, tuple[Array, ...], Strategy]:
+    """Compute pathwise hedge losses/accounting; inputs policy/paths/cost/mode, outputs losses/diagnostics/BN state."""
 
     batch, n_points, n_assets = prices.shape
     n_time = n_points - 1
@@ -391,11 +484,110 @@ def hedging_loss(strategy: Strategy, prices: Array, features: Array, epsilon: fl
     chex.assert_shape(error, (batch,))
     losses = -error
     chex.assert_shape(losses, (batch,))
-    loss = strategy.q + jnp.mean(jnp.maximum(losses - strategy.q, 0.0)) / (1.0 - alpha)
-    chex.assert_shape(loss, ())
     turnover = jnp.sum(jnp.abs(trades), axis=(1, 2))
     chex.assert_shape(turnover, (batch,))
-    return loss, (error, gains, costs, turnover, holdings), updated
+    return losses, (error, gains, costs, turnover, holdings), updated
+
+
+def hedging_loss(strategy: Strategy, prices: Array, features: Array, epsilon: float,
+                 strategy_config: StrategyConfig, training: bool, alpha: float = 0.95,
+                 strike: float = 100.0) -> tuple[Array, tuple[Array, ...], Strategy]:
+    """Compute nominal CVaR; inputs policy/paths/cost/mode, outputs loss, diagnostics, BN state."""
+
+    losses, diagnostics, updated = pathwise_hedging_loss(
+        strategy, prices, features, epsilon, strategy_config, training, strike)
+    batch = losses.shape[0]
+    chex.assert_shape(losses, (batch,))
+    loss = strategy.q + jnp.mean(jnp.maximum(losses - strategy.q, 0.0)) / (1.0 - alpha)
+    chex.assert_shape(loss, ())
+    return loss, diagnostics, updated
+
+
+def robust_hedging_loss(
+    strategy: Strategy,
+    robust_state: RobustState,
+    prices: Array,
+    variance: Array | None,
+    proposal_key: Array,
+    market: MarketConfig,
+    strategy_config: StrategyConfig,
+    robust_config: RobustConfig,
+    epsilon: float,
+    training: bool,
+) -> tuple[Array, tuple[Array, ...], Strategy]:
+    """Compute a WDRO hedge objective; inputs are model/base paths/key/configs, outputs objective/diagnostics/BN state."""
+
+    batch, n_points, n_assets = prices.shape
+    n_time = n_points - 1
+    expected_assets, n_features = market_dimensions(market)
+    chex.assert_shape(prices, (batch, n_time + 1, expected_assets))
+    raw_anchors = encode_trajectory(prices, variance, market)
+    dimension = raw_anchors.shape[1]
+    chex.assert_shape(raw_anchors, (batch, dimension))
+    chex.assert_shape(robust_state.location, (dimension,))
+    chex.assert_shape(robust_state.scale, (dimension,))
+    anchors = (raw_anchors - robust_state.location[None, :]) / robust_state.scale[None, :]
+    chex.assert_shape(anchors, (batch, dimension))
+    lambda_ = jax.nn.softplus(robust_state.raw_lambda)
+    chex.assert_shape(lambda_, ())
+    reference_scale = jnp.asarray(robust_config.proposal_scale, dtype=anchors.dtype)
+    chex.assert_shape(reference_scale, ())
+    temperature = robust_config.kl_epsilon + lambda_ * robust_config.tau
+    chex.assert_shape(temperature, ())
+
+    def log_target(anchor: Array, sample: Array) -> Array:
+        """Evaluate the ULA tilted log target; inputs are one anchor/sample, output is a scalar score."""
+
+        chex.assert_shape(anchor, (dimension,))
+        chex.assert_shape(sample, (dimension,))
+        physical_sample = sample * robust_state.scale + robust_state.location
+        chex.assert_shape(physical_sample, (dimension,))
+        proposed_prices, proposed_features, _ = decode_trajectory(physical_sample[None, :], market)
+        chex.assert_shape(proposed_prices, (1, n_time + 1, expected_assets))
+        chex.assert_shape(proposed_features, (1, n_time, n_features))
+        proposed_loss, _, _ = pathwise_hedging_loss(
+            strategy, proposed_prices, proposed_features, epsilon, strategy_config, False,
+            market.strike)
+        chex.assert_shape(proposed_loss, (1,))
+        difference = (sample - anchor) / reference_scale
+        chex.assert_shape(difference, (dimension,))
+        cost = 0.5 * jnp.sum(jnp.square(difference))
+        chex.assert_shape(cost, ())
+        penalized = proposed_loss[0] - lambda_ * cost
+        chex.assert_shape(penalized, ())
+        score = penalized / temperature if robust_config.objective == "entropic" else penalized
+        chex.assert_shape(score, ())
+        return score
+
+    proposals, log_weights = sample_langevin_proposal(
+        proposal_key, anchors, log_target, robust_config)
+    n_proposals = robust_config.proposal_samples
+    chex.assert_shape(proposals, (batch, n_proposals, dimension))
+    chex.assert_shape(log_weights, (batch, n_proposals))
+    flat_proposals = proposals.reshape(batch * n_proposals, dimension)
+    chex.assert_shape(flat_proposals, (batch * n_proposals, dimension))
+    physical_proposals = (flat_proposals * robust_state.scale[None, :]
+                          + robust_state.location[None, :])
+    chex.assert_shape(physical_proposals, (batch * n_proposals, dimension))
+    proposed_prices, proposed_features, _ = decode_trajectory(physical_proposals, market)
+    chex.assert_shape(proposed_prices, (batch * n_proposals, n_time + 1, expected_assets))
+    chex.assert_shape(proposed_features, (batch * n_proposals, n_time, n_features))
+    flat_losses, flat_diagnostics, updated = pathwise_hedging_loss(
+        strategy, proposed_prices, proposed_features, epsilon, strategy_config, training,
+        market.strike)
+    chex.assert_shape(flat_losses, (batch * n_proposals,))
+    pathwise_losses = flat_losses.reshape(batch, n_proposals)
+    chex.assert_shape(pathwise_losses, (batch, n_proposals))
+    transport_cost = quadratic_transport_cost(proposals, anchors, reference_scale)
+    chex.assert_shape(transport_cost, (batch, n_proposals))
+    if robust_config.objective == "entropic":
+        objective = entropic_dual(
+            robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
+    else:
+        objective = joint_cvar_dual(
+            robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
+    chex.assert_shape(objective, ())
+    return objective, (pathwise_losses, transport_cost, log_weights, *flat_diagnostics), updated
 
 
 def make_steps(optimizer: optax.GradientTransformation, strategy_config: StrategyConfig,
@@ -434,20 +626,123 @@ def make_steps(optimizer: optax.GradientTransformation, strategy_config: Strateg
     return train_step, evaluate
 
 
-def train(config: Config) -> tuple[Strategy, dict[str, list[float]]]:
-    """Train with online simulation and fixed validation; input config, outputs best strategy/history."""
+def make_robust_steps(
+    optimizer: optax.GradientTransformation,
+    market: MarketConfig,
+    strategy_config: StrategyConfig,
+    robust_config: RobustConfig,
+    epsilon: float,
+):
+    """Create top-level WDRO train/evaluation callables; inputs are optimizer/configs, outputs compiled steps."""
 
+    @eqx.filter_jit
+    def train_step(
+        strategy: Strategy,
+        robust_state: RobustState,
+        opt_state: optax.OptState,
+        prices: Array,
+        variance: Array | None,
+        proposal_key: Array,
+    ):
+        """Run one compiled WDRO Adam step; inputs are states/base paths/key, outputs updated states/loss/norm."""
+
+        def objective(parameters: tuple[Strategy, RobustState]):
+            """Differentiate the WDRO objective; input is model/dual state, output is loss and BN strategy."""
+
+            candidate, candidate_robust = parameters
+            loss, _, updated = robust_hedging_loss(
+                candidate, candidate_robust, prices, variance, proposal_key, market,
+                strategy_config, robust_config, epsilon, True)
+            return loss, updated
+
+        parameters = (strategy, robust_state)
+        (loss, bn_strategy), grads = eqx.filter_value_and_grad(objective, has_aux=True)(parameters)
+        strategy_grads, robust_grads = grads
+        strategy_grads = eqx.tree_at(
+            lambda candidate: (candidate.cash, candidate.q), strategy_grads,
+            (jnp.zeros_like(strategy_grads.cash), jnp.zeros_like(strategy_grads.q)))
+        if robust_config.objective == "entropic":
+            robust_grads = eqx.tree_at(
+                lambda candidate: candidate.eta, robust_grads,
+                jnp.zeros_like(robust_grads.eta))
+        robust_grads = eqx.tree_at(
+            lambda candidate: (candidate.location, candidate.scale), robust_grads,
+            (jnp.zeros_like(robust_grads.location), jnp.zeros_like(robust_grads.scale)))
+        grads = (strategy_grads, robust_grads)
+        updates, opt_state = optimizer.update(grads, opt_state, parameters)
+        strategy, robust_state = eqx.apply_updates(parameters, updates)
+        strategy = eqx.tree_at(
+            lambda candidate: (candidate.mean1, candidate.var1, candidate.mean2, candidate.var2),
+            strategy, (bn_strategy.mean1, bn_strategy.var1, bn_strategy.mean2, bn_strategy.var2))
+        grad_norm = optax.tree.norm(grads)
+        chex.assert_shape(loss, ())
+        chex.assert_shape(grad_norm, ())
+        return strategy, robust_state, opt_state, loss, grad_norm
+
+    @eqx.filter_jit
+    def evaluate(
+        strategy: Strategy,
+        robust_state: RobustState,
+        prices: Array,
+        variance: Array | None,
+        proposal_key: Array,
+    ):
+        """Evaluate a frozen-BN WDRO policy; inputs are states/base paths/key, outputs objective/diagnostics."""
+
+        loss, diagnostics, _ = robust_hedging_loss(
+            strategy, robust_state, prices, variance, proposal_key, market,
+            strategy_config, robust_config, epsilon, False)
+        return loss, diagnostics
+
+    return train_step, evaluate
+
+
+def train(config: Config) -> tuple[Strategy, RobustState | None, dict[str, list[float]]]:
+    """Train nominal or WDRO hedging with fixed validation; input config, outputs best model/dual/history."""
+
+    if config.robust.enabled:
+        if config.robust.rho < 0.0 or config.robust.kl_epsilon <= 0.0 or config.robust.tau < 0.0:
+            raise ValueError("rho and tau must be nonnegative and kl_epsilon must be positive")
+        if not 0.0 < config.robust.alpha < 1.0:
+            raise ValueError("robust alpha must lie strictly between zero and one")
+        if config.robust.proposal_samples < 1 or config.robust.initial_lambda <= 0.0:
+            raise ValueError("proposal_samples and initial_lambda must be positive")
     key = jax.random.PRNGKey(config.training.seed)
-    key, init_key, validation_key = jax.random.split(key, 3)
+    key, init_key, standardization_key, validation_key, validation_proposal_key = jax.random.split(key, 5)
     strategy = initialize_strategy(init_key, config.market)
     optimizer = optax.adam(config.training.learning_rate)
-    opt_state = optimizer.init(eqx.filter(strategy, eqx.is_array))
-    train_step, evaluate = make_steps(optimizer, config.strategy, config.epsilon, config.alpha, config.market.strike)
     simulate_training = jax.jit(lambda simulation_key: simulate_market(
         simulation_key, config.market, config.training.batch_size))
     simulate_validation = jax.jit(lambda simulation_key: simulate_market(
         simulation_key, config.market, config.training.validation_size))
-    validation_prices, validation_features, _ = simulate_validation(validation_key)
+    validation_prices, validation_features, validation_variance = simulate_validation(validation_key)
+    raw_lambda = jnp.log(jnp.expm1(jnp.asarray(config.robust.initial_lambda, dtype=strategy.cash.dtype)))
+    chex.assert_shape(raw_lambda, ())
+    eta = jnp.asarray(config.robust.initial_eta, dtype=strategy.cash.dtype)
+    chex.assert_shape(eta, ())
+    if config.robust.enabled:
+        standardization_prices, _, standardization_variance = simulate_validation(
+            standardization_key)
+        standardization_coordinates = encode_trajectory(
+            standardization_prices, standardization_variance, config.market)
+        dimension = standardization_coordinates.shape[1]
+        chex.assert_shape(
+            standardization_coordinates, (config.training.validation_size, dimension))
+        coordinate_location = jnp.mean(standardization_coordinates, axis=0)
+        chex.assert_shape(coordinate_location, (dimension,))
+        coordinate_scale = jnp.maximum(jnp.std(standardization_coordinates, axis=0), 1e-3)
+        chex.assert_shape(coordinate_scale, (dimension,))
+        robust_state = RobustState(raw_lambda, eta, coordinate_location, coordinate_scale)
+    else:
+        robust_state = None
+    parameters = (strategy, robust_state) if robust_state is not None else strategy
+    opt_state = optimizer.init(eqx.filter(parameters, eqx.is_array))
+    if robust_state is not None:
+        train_step, evaluate = make_robust_steps(
+            optimizer, config.market, config.strategy, config.robust, config.epsilon)
+    else:
+        train_step, evaluate = make_steps(
+            optimizer, config.strategy, config.epsilon, config.alpha, config.market.strike)
     calibration_config = dataclasses.replace(config.strategy, bn_momentum=0.0)
 
     @eqx.filter_jit
@@ -458,50 +753,101 @@ def train(config: Config) -> tuple[Strategy, dict[str, list[float]]]:
         return calibrated
 
     best_strategy = strategy
+    best_robust_state = robust_state
     best_loss = float("inf")
-    history: dict[str, list[float]] = {"step": [], "train_loss": [], "validation_loss": [], "grad_norm": []}
+    history: dict[str, list[float]] = {
+        "step": [], "train_loss": [], "validation_loss": [], "grad_norm": [],
+        "lambda": [], "eta": []}
     for step in range(config.training.steps):
-        key, batch_key = jax.random.split(key)
-        prices, features, _ = simulate_training(batch_key)
-        strategy, opt_state, loss, grad_norm = train_step(strategy, opt_state, prices, features)
+        key, batch_key, proposal_key = jax.random.split(key, 3)
+        prices, features, variance = simulate_training(batch_key)
+        if robust_state is None:
+            strategy, opt_state, loss, grad_norm = train_step(
+                strategy, opt_state, prices, features)
+        else:
+            strategy, robust_state, opt_state, loss, grad_norm = train_step(
+                strategy, robust_state, opt_state, prices, variance, proposal_key)
         if step % config.training.validation_frequency == 0 or step == config.training.steps - 1:
             strategy = calibrate(strategy)
-            validation_loss, _ = evaluate(strategy, validation_prices, validation_features)
+            if robust_state is None:
+                validation_loss, _ = evaluate(strategy, validation_prices, validation_features)
+                lambda_value = eta_value = 0.0
+            else:
+                validation_loss, _ = evaluate(
+                    strategy, robust_state, validation_prices, validation_variance,
+                    validation_proposal_key)
+                lambda_value = float(jax.nn.softplus(robust_state.raw_lambda))
+                eta_value = float(robust_state.eta)
             value = float(validation_loss)
             history["step"].append(step)
             history["train_loss"].append(float(loss))
             history["validation_loss"].append(value)
             history["grad_norm"].append(float(grad_norm))
+            history["lambda"].append(lambda_value)
+            history["eta"].append(eta_value)
             if value < best_loss:
                 best_loss = value
                 best_strategy = jax.tree.map(lambda x: jnp.array(x), strategy)
-            print(f"step={step:6d} train={float(loss):.6f} validation={value:.6f} cash={float(strategy.cash):.4f}")
-    return best_strategy, history
+                best_robust_state = None if robust_state is None else jax.tree.map(
+                    lambda x: jnp.array(x), robust_state)
+            print(f"step={step:6d} train={float(loss):.6f} validation={value:.6f} "
+                  f"lambda={lambda_value:.4f} eta={eta_value:.4f}")
+    return best_strategy, best_robust_state, history
 
 
-def evaluate_chunks(strategy: Strategy, config: Config) -> dict[str, float | list[float]]:
-    """Evaluate independent chunks; inputs trained strategy/config, output aggregate metrics dictionary."""
+def evaluate_chunks(
+    strategy: Strategy, robust_state: RobustState | None, config: Config,
+) -> dict[str, float | list[float]]:
+    """Evaluate independent chunks; inputs trained model/dual/config, output aggregate metrics dictionary."""
 
     paths = 1_000_000 if config.evaluation.paper_scale else config.evaluation.paths
-    _, evaluate = make_steps(optax.adam(config.training.learning_rate), config.strategy,
-                             config.epsilon, config.alpha, config.market.strike)
+    optimizer = optax.adam(config.training.learning_rate)
+    _, evaluate = make_steps(optimizer, config.strategy, config.epsilon,
+                             config.alpha, config.market.strike)
+    robust_evaluate = None
+    if robust_state is not None:
+        _, robust_evaluate = make_robust_steps(
+            optimizer, config.market, config.strategy, config.robust, config.epsilon)
+    chunk_limit = config.evaluation.chunk_size
+    if robust_state is not None:
+        chunk_limit = max(1, chunk_limit // config.robust.proposal_samples)
     simulate_full_chunk = jax.jit(lambda simulation_key: simulate_market(
-        simulation_key, config.market, config.evaluation.chunk_size))
+        simulation_key, config.market, chunk_limit))
     key = jax.random.PRNGKey(config.training.seed + 10_000)
     errors, costs, turnovers, holdings, turnover_dates = [], [], [], [], []
-    chunk_sizes = []
+    chunk_sizes, robust_values = [], []
+    robust_transport_means, robust_loss_means, robust_ess_means = [], [], []
     remaining = paths
     while remaining:
-        size = min(remaining, config.evaluation.chunk_size)
-        key, chunk_key = jax.random.split(key)
-        if size == config.evaluation.chunk_size:
-            prices, features, _ = simulate_full_chunk(chunk_key)
+        size = min(remaining, chunk_limit)
+        key, chunk_key, proposal_key = jax.random.split(key, 3)
+        if size == chunk_limit:
+            prices, features, variance = simulate_full_chunk(chunk_key)
         else:
             simulate_remainder = jax.jit(lambda simulation_key: simulate_market(
                 simulation_key, config.market, size))
-            prices, features, _ = simulate_remainder(chunk_key)
+            prices, features, variance = simulate_remainder(chunk_key)
         _, diagnostics = evaluate(strategy, prices, features)
         error, _, cost, turnover, chunk_holdings = diagnostics
+        if robust_state is not None and robust_evaluate is not None:
+            robust_value, robust_diagnostics = robust_evaluate(
+                strategy, robust_state, prices, variance, proposal_key)
+            robust_losses, robust_transport, robust_log_weights = robust_diagnostics[:3]
+            chex.assert_shape(
+                robust_losses, (size, config.robust.proposal_samples))
+            chex.assert_shape(
+                robust_transport, (size, config.robust.proposal_samples))
+            chex.assert_shape(
+                robust_log_weights, (size, config.robust.proposal_samples))
+            log_weights_np = np.asarray(robust_log_weights)
+            shifted_weights = np.exp(
+                log_weights_np - np.max(log_weights_np, axis=1, keepdims=True))
+            effective_sample_size = np.square(np.sum(shifted_weights, axis=1)) / np.sum(
+                np.square(shifted_weights), axis=1)
+            robust_values.append(float(robust_value))
+            robust_transport_means.append(float(np.mean(np.asarray(robust_transport))))
+            robust_loss_means.append(float(np.mean(np.asarray(robust_losses))))
+            robust_ess_means.append(float(np.mean(effective_sample_size)))
         errors.append(np.asarray(error))
         costs.append(np.asarray(cost))
         turnovers.append(np.asarray(turnover))
@@ -517,20 +863,43 @@ def evaluate_chunks(strategy: Strategy, config: Config) -> dict[str, float | lis
     losses_np = -error_np
     threshold = float(np.quantile(losses_np, config.alpha))
     cvar = float(np.mean(losses_np[losses_np >= threshold]))
-    return {"mse": float(np.mean(error_np**2)), "cvar": cvar, "cash": float(strategy.cash),
-            "error_mean": float(np.mean(error_np)), "error_std": float(np.std(error_np)),
-            "error_quantiles": np.quantile(error_np, [0.01, 0.05, 0.5, 0.95, 0.99]).tolist(),
-            "mean_cost": float(np.mean(cost_np)), "mean_turnover": float(np.mean(turnover_np)),
-            "mean_holdings": np.average(np.stack(holdings), axis=0, weights=chunk_sizes).tolist(),
-            "mean_turnover_by_date": np.average(np.stack(turnover_dates), axis=0,
-                                                 weights=chunk_sizes).tolist(),
-            "errors": error_np.tolist()}
+    metrics = {"mse": float(np.mean(error_np**2)), "cvar": cvar, "cash": float(strategy.cash),
+               "error_mean": float(np.mean(error_np)), "error_std": float(np.std(error_np)),
+               "error_quantiles": np.quantile(error_np, [0.01, 0.05, 0.5, 0.95, 0.99]).tolist(),
+               "mean_cost": float(np.mean(cost_np)), "mean_turnover": float(np.mean(turnover_np)),
+               "mean_holdings": np.average(np.stack(holdings), axis=0, weights=chunk_sizes).tolist(),
+               "mean_turnover_by_date": np.average(np.stack(turnover_dates), axis=0,
+                                                    weights=chunk_sizes).tolist(),
+               "errors": error_np.tolist()}
+    if robust_state is not None:
+        metrics["robust_objective"] = float(np.average(robust_values, weights=chunk_sizes))
+        metrics["lambda"] = float(jax.nn.softplus(robust_state.raw_lambda))
+        metrics["eta"] = float(robust_state.eta)
+        metrics["mean_transport_cost"] = float(np.average(
+            robust_transport_means, weights=chunk_sizes))
+        metrics["mean_proposed_loss"] = float(np.average(
+            robust_loss_means, weights=chunk_sizes))
+        metrics["mean_importance_ess"] = float(np.average(
+            robust_ess_means, weights=chunk_sizes))
+        metrics["proposal_samples"] = config.robust.proposal_samples
+        metrics["proposal_scale"] = config.robust.proposal_scale
+        metrics["ula_steps"] = config.robust.ula_steps
+    return metrics
 
 
-def save_artifacts(strategy: Strategy, history: dict[str, list[float]], metrics: dict, config: Config) -> Path:
+def save_artifacts(
+    strategy: Strategy,
+    history: dict[str, list[float]],
+    metrics: dict,
+    config: Config,
+    robust_state: RobustState | None = None,
+) -> Path:
     """Save config/model/metrics/plots; inputs completed run objects, output artifact directory path."""
 
-    directory = Path(config.evaluation.output_dir) / f"{config.market.name}_cost_{config.epsilon:g}"
+    suffix = f"{config.market.name}_cost_{config.epsilon:g}"
+    if robust_state is not None:
+        suffix += f"_{config.robust.objective}_ula_{config.robust.ula_steps}"
+    directory = Path(config.evaluation.output_dir) / suffix
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text(json.dumps(dataclasses.asdict(config), indent=2))
     diagnostic_prices = diagnostic_learned = diagnostic_analytic = None
@@ -560,15 +929,20 @@ def save_artifacts(strategy: Strategy, history: dict[str, list[float]], metrics:
         delta_correlation = delta_correlation_matrix[0, 1]
         chex.assert_shape(delta_correlation, ())
         metrics["analytic_delta_rmse"] = float(delta_rmse)
-        metrics["analytic_delta_correlation"] = float(delta_correlation)
+        delta_correlation_value = float(delta_correlation)
+        metrics["analytic_delta_correlation"] = (
+            delta_correlation_value if np.isfinite(delta_correlation_value) else None)
     serializable_metrics = {key: value for key, value in metrics.items() if key != "errors"}
     (directory / "metrics.json").write_text(json.dumps(serializable_metrics, indent=2))
     (directory / "history.json").write_text(json.dumps(history, indent=2))
     eqx.tree_serialise_leaves(directory / "model.eqx", strategy)
+    if robust_state is not None:
+        eqx.tree_serialise_leaves(directory / "robust.eqx", robust_state)
     figure, axis = plt.subplots()
     axis.plot(history["step"], history["train_loss"], label="train")
     axis.plot(history["step"], history["validation_loss"], label="validation")
-    axis.set_yscale("log")
+    all_losses = np.asarray(history["train_loss"] + history["validation_loss"])
+    axis.set_yscale("log" if np.all(all_losses > 0.0) else "symlog")
     axis.legend()
     figure.savefig(directory / "loss.png", dpi=160)
     plt.close(figure)
@@ -602,21 +976,35 @@ def save_artifacts(strategy: Strategy, history: dict[str, list[float]], metrics:
         axis.legend(fontsize="small")
         figure.savefig(directory / "analytic_delta.png", dpi=160)
         plt.close(figure)
-    comparison = Path(config.evaluation.output_dir) / "comparison.csv"
+    comparison_name = "comparison.csv" if robust_state is None else "robust_comparison.csv"
+    comparison = Path(config.evaluation.output_dir) / comparison_name
     rows = {}
     if comparison.exists():
         for line in comparison.read_text().splitlines()[1:]:
             fields = line.split(",")
-            if len(fields) == 6:
+            if robust_state is None and len(fields) == 6:
                 fields = [fields[0], fields[1], "0", "float32", "100000", *fields[2:]]
-            rows[(fields[0], fields[1])] = fields
+            row_key = (fields[0], fields[1]) if robust_state is None else (
+                fields[0], fields[1], fields[2], fields[3])
+            rows[row_key] = fields
     evaluation_paths = 1_000_000 if config.evaluation.paper_scale else config.evaluation.paths
-    row = [config.market.name, f"{config.epsilon:g}", str(config.training.seed), config.market.dtype,
-           str(evaluation_paths), f"{config.alpha:g}", str(serializable_metrics["mse"]),
-           str(serializable_metrics["cvar"]), str(serializable_metrics["cash"]),
-           str(serializable_metrics["mean_cost"]), str(serializable_metrics["mean_turnover"])]
-    rows[(row[0], row[1])] = row
-    header = "market,epsilon,seed,dtype,evaluation_paths,alpha,mse,cvar,cash,mean_cost,mean_turnover\n"
+    if robust_state is None:
+        row = [config.market.name, f"{config.epsilon:g}", str(config.training.seed), config.market.dtype,
+               str(evaluation_paths), f"{config.alpha:g}", str(serializable_metrics["mse"]),
+               str(serializable_metrics["cvar"]), str(serializable_metrics["cash"]),
+               str(serializable_metrics["mean_cost"]), str(serializable_metrics["mean_turnover"])]
+        rows[(row[0], row[1])] = row
+        header = "market,epsilon,seed,dtype,evaluation_paths,alpha,mse,cvar,cash,mean_cost,mean_turnover\n"
+    else:
+        row = [config.market.name, f"{config.epsilon:g}", config.robust.objective,
+               str(config.robust.ula_steps), str(config.training.seed), config.market.dtype,
+               str(evaluation_paths), f"{config.robust.alpha:g}",
+               str(serializable_metrics["robust_objective"]), str(serializable_metrics["lambda"]),
+               str(serializable_metrics["eta"]), str(serializable_metrics["cash"]),
+               str(serializable_metrics["mean_cost"]), str(serializable_metrics["mean_turnover"])]
+        rows[(row[0], row[1], row[2], row[3])] = row
+        header = ("market,epsilon,objective,ula_steps,seed,dtype,evaluation_paths,alpha,"
+                  "robust_objective,lambda,eta,cash,mean_cost,mean_turnover\n")
     comparison.write_text(header + "\n".join(",".join(value) for value in rows.values()) + "\n")
     return directory
 
@@ -626,14 +1014,21 @@ def main(config: Config) -> None:
 
     if config.market.dtype == "float64":
         jax.config.update("jax_enable_x64", True)
-    strategy, history = train(config)
-    metrics = evaluate_chunks(strategy, config)
-    metrics["final_train_cvar"] = history["train_loss"][-1]
-    metrics["best_validation_cvar"] = min(history["validation_loss"])
-    # CVaR indifference price: cash such that CVaR(losses - cash) = 0
-    strategy = eqx.tree_at(lambda s: s.cash, strategy, jnp.asarray(metrics["cvar"], dtype=strategy.cash.dtype))
-    metrics["cash"] = metrics["cvar"]
-    directory = save_artifacts(strategy, history, metrics, config)
+    strategy, robust_state, history = train(config)
+    metrics = evaluate_chunks(strategy, robust_state, config)
+    if robust_state is None:
+        metrics["final_train_cvar"] = history["train_loss"][-1]
+        metrics["best_validation_cvar"] = min(history["validation_loss"])
+        indifference_price = metrics["cvar"]
+    else:
+        metrics["final_train_robust"] = history["train_loss"][-1]
+        metrics["best_validation_robust"] = min(history["validation_loss"])
+        indifference_price = metrics["robust_objective"]
+    strategy = eqx.tree_at(
+        lambda candidate: candidate.cash, strategy,
+        jnp.asarray(indifference_price, dtype=strategy.cash.dtype))
+    metrics["cash"] = indifference_price
+    directory = save_artifacts(strategy, history, metrics, config, robust_state)
     print(json.dumps({key: value for key, value in metrics.items() if key != "errors"}, indent=2))
     print(f"saved={directory}")
 
