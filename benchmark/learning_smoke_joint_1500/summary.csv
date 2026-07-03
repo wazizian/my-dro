@@ -1,0 +1,2 @@
+mode,learned,objective_learning,risk_improving,tail_calibrated,initial_native_objective,trained_native_objective,native_improvement_fraction,validation_cvar_improvement_fraction,validation_stop_loss_improvement_fraction,trained_active_tail_fraction,finite_nonzero_grad_fraction,strategy_parameter_distance,lambda,eta
+joint_cvar,True,True,True,True,2.9102530479431152,0.7867794036865234,0.7296525797842229,0.5983952263438803,0.13762050032918127,0.02435302734375,1.0,1.957921022646341,1.3056031465530396,0.551594614982605

@@ -1,0 +1,14 @@
+{
+  "steps": 500,
+  "batch_size": 64,
+  "validation_size": 2048,
+  "evaluation_size": 10000,
+  "validation_frequency": 25,
+  "learning_rate": 0.001,
+  "proposal_samples": 8,
+  "proposal_scale": 0.05,
+  "ula_steps": 0,
+  "ula_step_size": 0.0025,
+  "seed": 0,
+  "output_dir": "benchmark/learning_smoke_k0"
+}

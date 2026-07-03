@@ -1,0 +1,2 @@
+mode,learned,objective_learning,risk_improving,tail_calibrated,proposal_healthy,initial_native_objective,trained_native_objective,native_improvement_fraction,validation_cvar_improvement_fraction,validation_stop_loss_improvement_fraction,trained_active_tail_fraction,trained_normalized_ess,finite_nonzero_grad_fraction,strategy_parameter_distance,lambda,eta
+entropic,False,True,False,True,True,-0.48525816202163696,-0.938715934753418,0.9344670697400077,-0.4360234238897655,-0.014048727612269699,0.07110595703125,0.382049560546875,1.0,0.8408313706465023,1.3461618423461914,0.0
