@@ -123,6 +123,33 @@ def test_costs_are_exactly_zero_or_nonnegative():
     assert bool(jnp.any(positive_cost > 0.0))
 
 
+def test_hedging_loss_matches_cvar_definition():
+    """Verify CVaR equals q plus the scaled mean excess loss for a known loss sample."""
+
+    market = MarketConfig(n_time=1, horizon=1 / 365)
+    strategy = initialize_strategy(jax.random.PRNGKey(19), market)
+    network_leaves = (strategy.w1, strategy.b1, strategy.w2, strategy.b2, strategy.w3, strategy.b3)
+    strategy = eqx.tree_at(
+        lambda candidate: (candidate.w1, candidate.b1, candidate.w2,
+                           candidate.b2, candidate.w3, candidate.b3),
+        strategy,
+        tuple(jnp.zeros_like(leaf) for leaf in network_leaves),
+    )
+    strategy = eqx.tree_at(lambda candidate: candidate.q, strategy, jnp.asarray(1.0))
+    terminal = jnp.asarray([100.0, 101.0, 102.0, 103.0])
+    chex.assert_shape(terminal, (4,))
+    initial = jnp.full((4,), 100.0)
+    chex.assert_shape(initial, (4,))
+    prices = jnp.stack((initial, terminal), axis=1)[:, :, None]
+    chex.assert_shape(prices, (4, 2, 1))
+    features = jnp.log(prices[:, :-1])
+    chex.assert_shape(features, (4, 1, 1))
+    loss, _, _ = hedging_loss(
+        strategy, prices, features, 0.0, StrategyConfig(), False, alpha=0.5)
+    chex.assert_shape(loss, ())
+    np.testing.assert_allclose(loss, 2.5)
+
+
 def test_jitted_optimizer_step_is_finite_and_updates_parameters():
     """Verify one top-level compiled Adam step returns finite values and changes trainable leaves."""
 
@@ -139,7 +166,7 @@ def test_jitted_optimizer_step_is_finite_and_updates_parameters():
 
 
 def test_short_fixed_batch_training_reduces_loss():
-    """Verify fixed validation inference MSE falls after training on a separate fixed batch."""
+    """Verify fixed validation CVaR falls after training on a separate fixed batch."""
 
     market = MarketConfig(n_time=3, horizon=3 / 365)
     strategy = initialize_strategy(jax.random.PRNGKey(6), market)

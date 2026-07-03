@@ -66,5 +66,6 @@ risk-neutral measure. The learned-delta correlation is `0.9924`.
 
 Under the earlier MSE objective with jointly fitted cash, average transaction
 costs were absorbed by the cash intercept so the cost-reduction incentive was
-absent. CVaR is cash-invariant, which pins the indifference price uniquely and
-ensures the full cost distribution — not just its variance — enters the gradient.
+absent. Under the CVaR objective, cash is excluded from training and recovered
+afterward as the indifference price, so the full cost distribution enters the
+strategy gradient.

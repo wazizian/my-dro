@@ -339,7 +339,7 @@ def strategy_apply(strategy: Strategy, features: Array, config: StrategyConfig, 
 def hedging_loss(strategy: Strategy, prices: Array, features: Array, epsilon: float,
                  strategy_config: StrategyConfig, training: bool, alpha: float = 0.95,
                  strike: float = 100.0) -> tuple[Array, tuple[Array, ...], Strategy]:
-    """Compute MSE and accounting; inputs policy/paths/cost/mode, outputs loss, diagnostics, BN state."""
+    """Compute CVaR and accounting; inputs policy/paths/cost/mode, outputs loss, diagnostics, BN state."""
 
     batch, n_points, n_assets = prices.shape
     n_time = n_points - 1
@@ -407,7 +407,7 @@ def make_steps(optimizer: optax.GradientTransformation, strategy_config: Strateg
         """Run one compiled Adam step; inputs state and batch, outputs updated state/loss/gradient norm."""
 
         def objective(candidate: Strategy):
-            """Differentiate training MSE; input candidate strategy, output loss and updated BN strategy."""
+            """Differentiate training CVaR; input candidate strategy, output loss and updated BN strategy."""
 
             loss, _, updated = hedging_loss(candidate, prices, features, epsilon, strategy_config, True, alpha, strike)
             return loss, updated
@@ -628,8 +628,8 @@ def main(config: Config) -> None:
         jax.config.update("jax_enable_x64", True)
     strategy, history = train(config)
     metrics = evaluate_chunks(strategy, config)
-    metrics["final_train_mse"] = history["train_loss"][-1]
-    metrics["best_validation_mse"] = min(history["validation_loss"])
+    metrics["final_train_cvar"] = history["train_loss"][-1]
+    metrics["best_validation_cvar"] = min(history["validation_loss"])
     # CVaR indifference price: cash such that CVaR(losses - cash) = 0
     strategy = eqx.tree_at(lambda s: s.cash, strategy, jnp.asarray(metrics["cvar"], dtype=strategy.cash.dtype))
     metrics["cash"] = metrics["cvar"]
