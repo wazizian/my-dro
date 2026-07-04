@@ -21,6 +21,7 @@ from wdro import (
     RobustState,
     entropic_dual,
     joint_cvar_dual,
+    per_sample_cvar_dual,
     quadratic_transport_cost,
     sample_langevin_proposal,
 )
@@ -551,11 +552,17 @@ def robust_hedging_loss(
         chex.assert_shape(proposed_loss, (1,))
         difference = (sample - anchor) / reference_scale
         chex.assert_shape(difference, (dimension,))
-        cost = 0.5 * jnp.sum(jnp.square(difference))
+        squared_distance = jnp.sum(jnp.square(difference))
+        chex.assert_shape(squared_distance, ())
+        if robust_config.cost_power == 1:
+            cost = jnp.sqrt(jnp.maximum(squared_distance, 1e-12))
+        else:
+            cost = 0.5 * squared_distance
         chex.assert_shape(cost, ())
         penalized = proposed_loss[0] - lambda_ * cost
         chex.assert_shape(penalized, ())
-        score = penalized / temperature if robust_config.objective == "entropic" else penalized
+        temper = robust_config.objective == "entropic" or robust_config.ula_temper
+        score = penalized / temperature if temper else penalized
         chex.assert_shape(score, ())
         return score
 
@@ -578,10 +585,14 @@ def robust_hedging_loss(
     chex.assert_shape(flat_losses, (batch * n_proposals,))
     pathwise_losses = flat_losses.reshape(batch, n_proposals)
     chex.assert_shape(pathwise_losses, (batch, n_proposals))
-    transport_cost = quadratic_transport_cost(proposals, anchors, reference_scale)
+    transport_cost = quadratic_transport_cost(
+        proposals, anchors, reference_scale, robust_config.cost_power)
     chex.assert_shape(transport_cost, (batch, n_proposals))
     if robust_config.objective == "entropic":
         objective = entropic_dual(
+            robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
+    elif robust_config.objective == "per_sample_cvar":
+        objective = per_sample_cvar_dual(
             robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
     else:
         objective = joint_cvar_dual(
@@ -661,10 +672,15 @@ def make_robust_steps(
         strategy_grads = eqx.tree_at(
             lambda candidate: (candidate.cash, candidate.q), strategy_grads,
             (jnp.zeros_like(strategy_grads.cash), jnp.zeros_like(strategy_grads.q)))
-        if robust_config.objective == "entropic":
+        if (robust_config.objective in ("entropic", "per_sample_cvar")
+                or (robust_config.objective == "joint_cvar" and robust_config.exact_eta)):
             robust_grads = eqx.tree_at(
                 lambda candidate: candidate.eta, robust_grads,
                 jnp.zeros_like(robust_grads.eta))
+        if robust_config.fix_lambda:
+            robust_grads = eqx.tree_at(
+                lambda candidate: candidate.raw_lambda, robust_grads,
+                jnp.zeros_like(robust_grads.raw_lambda))
         robust_grads = eqx.tree_at(
             lambda candidate: (candidate.location, candidate.scale), robust_grads,
             (jnp.zeros_like(robust_grads.location), jnp.zeros_like(robust_grads.scale)))

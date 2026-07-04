@@ -160,7 +160,28 @@ Evaluate volatility:
 
 The 0.20 case is in-distribution.
 
-### 6.3 Heston shifts
+### 6.3 Black--Scholes rate shifts
+
+Evaluate risk-free rate:
+
+    0.00, 0.02, 0.05, 0.08
+
+The 0.00 case is in-distribution and matches the current zero-rate simulator.
+
+This requires adding a `rate` field to `MarketConfig` (default `0.0`) and
+incorporating it into the Black--Scholes drift:
+
+\[
+d\log S_t=\left(r-\tfrac12\sigma^2\right)dt+\sigma\,dW_t.
+\]
+
+Apply the shift only to the market path simulator. Leave discounting and
+strategy accounting as currently implemented unless a separate discounting
+review changes them. Cross with the volatility grid in section 6.2 only for
+the frozen moderate/severe combined scenarios, not as a full Cartesian
+product, to keep the stress grid tractable.
+
+### 6.4 Heston shifts
 
 Use one-at-a-time shifts:
 
@@ -183,7 +204,7 @@ Also freeze two combined scenarios before final testing:
       correlation = -0.9
       kappa = 0.5
 
-### 6.4 Transaction-cost misspecification
+### 6.5 Transaction-cost misspecification
 
 Evaluate each fixed strategy with realized costs:
 
@@ -191,7 +212,7 @@ Evaluate each fixed strategy with realized costs:
 
 This separates market-path robustness from execution-cost robustness.
 
-### 6.5 Random coordinate stress
+### 6.6 Random coordinate stress
 
 In shared standardized trajectory coordinates, add Gaussian perturbations with
 scales:
@@ -200,7 +221,7 @@ scales:
 
 Use common perturbation noise and decode to valid market trajectories.
 
-### 6.6 Transport-radius stress
+### 6.7 Transport-radius stress
 
 The current cost is
 
@@ -226,7 +247,7 @@ Evaluate:
 
 Report both raw and normalized radius.
 
-### 6.7 Common adversarial stress
+### 6.8 Common adversarial stress
 
 Implement an evaluation-only projected-gradient attack:
 

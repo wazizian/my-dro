@@ -1,0 +1,11 @@
+market,lambda_fixed,in_distribution,worst_stress
+black_scholes,0.001,3.0461,4.3676
+black_scholes,0.005,3.0397,4.2644
+black_scholes,0.02,2.9384,4.107
+black_scholes,0.05,3.1897,4.7632
+black_scholes,0.1,4.2226,6.5748
+heston,0.001,2.5954,2.9895
+heston,0.005,2.506,2.821
+heston,0.02,2.7003,3.1084
+heston,0.05,2.9172,3.3514
+heston,0.1,2.9329,3.2699

@@ -18,18 +18,24 @@ class RobustConfig:
     """Configure a WDRO dual and proposal; inputs are scalar hyperparameters."""
 
     enabled: bool = False
-    objective: Literal["entropic", "joint_cvar"] = "entropic"
+    objective: Literal["entropic", "joint_cvar", "per_sample_cvar"] = "entropic"
     rho: float = 0.1
     kl_epsilon: float = 0.1
     tau: float = 0.0
     alpha: float = 0.95
     proposal_samples: int = 32
     proposal_scale: float = 0.1
+    proposal_family: Literal["gaussian", "laplace"] = "gaussian"
     ula_steps: int = 0
     ula_step_size: float = 0.01
     ula_gradient_clip: float = 10.0
     initial_lambda: float = 1.0
     initial_eta: float = 0.0
+    fix_lambda: bool = False
+    cost_power: Literal[1, 2] = 2
+    tail_power: float = 1.0
+    exact_eta: bool = False
+    ula_temper: bool = False
 
 
 class RobustState(eqx.Module):
@@ -58,15 +64,38 @@ def gaussian_log_density(value: Array, mean: Array, variance: Array) -> Array:
     return log_density
 
 
-def quadratic_transport_cost(samples: Array, anchors: Array, reference_scale: Array) -> Array:
-    """Compute Gaussian-reference transport cost; inputs are proposed/base coordinates/scale, output is (batch, proposals)."""
+def laplace_log_density(value: Array, mean: Array, scale: Array) -> Array:
+    """Evaluate isotropic Laplace log densities; inputs share shape (..., dimension), output is (...)."""
+
+    chex.assert_equal_shape((value, mean))
+    dimension = value.shape[-1]
+    chex.assert_shape(scale, ())
+    difference = value - mean
+    chex.assert_shape(difference, value.shape)
+    absolute_distance = jnp.sum(jnp.abs(difference), axis=-1)
+    normalization = dimension * jnp.log(2.0 * scale)
+    chex.assert_shape(normalization, ())
+    log_density = -(absolute_distance / scale + normalization)
+    chex.assert_shape(log_density, value.shape[:-1])
+    return log_density
+
+
+def quadratic_transport_cost(
+    samples: Array, anchors: Array, reference_scale: Array, cost_power: int = 2
+) -> Array:
+    """Compute standardized transport cost; inputs are proposed/base coordinates/scale/power (1=norm, 2=half squared norm), output is (batch, proposals)."""
 
     batch, n_proposals, dimension = samples.shape
     chex.assert_shape(anchors, (batch, dimension))
     chex.assert_shape(reference_scale, ())
     differences = (samples - anchors[:, None, :]) / reference_scale
     chex.assert_shape(differences, (batch, n_proposals, dimension))
-    costs = 0.5 * jnp.sum(jnp.square(differences), axis=2)
+    squared_distance = jnp.sum(jnp.square(differences), axis=2)
+    chex.assert_shape(squared_distance, (batch, n_proposals))
+    if cost_power == 1:
+        costs = jnp.sqrt(jnp.maximum(squared_distance, 1e-12))
+    else:
+        costs = 0.5 * squared_distance
     chex.assert_shape(costs, (batch, n_proposals))
     return costs
 
@@ -89,7 +118,10 @@ def sample_langevin_proposal(
         raise ValueError("proposal scale, ULA step size, and gradient clip must be positive")
     keys = jax.random.split(key, n_steps + 1)
     chex.assert_shape(keys, (n_steps + 1, 2))
-    initial_noise = jax.random.normal(keys[0], (batch, n_proposals, dimension), dtype=anchors.dtype)
+    if config.proposal_family == "laplace":
+        initial_noise = jax.random.laplace(keys[0], (batch, n_proposals, dimension), dtype=anchors.dtype)
+    else:
+        initial_noise = jax.random.normal(keys[0], (batch, n_proposals, dimension), dtype=anchors.dtype)
     chex.assert_shape(initial_noise, (batch, n_proposals, dimension))
     initial = anchors[:, None, :] + config.proposal_scale * initial_noise
     chex.assert_shape(initial, (batch, n_proposals, dimension))
@@ -137,11 +169,16 @@ def sample_langevin_proposal(
     chex.assert_shape(final_mean, (batch, n_proposals, dimension))
     reference_mean = jnp.broadcast_to(anchors[:, None, :], final.shape)
     chex.assert_shape(reference_mean, (batch, n_proposals, dimension))
-    reference_variance = jnp.asarray(config.proposal_scale**2, dtype=anchors.dtype)
-    chex.assert_shape(reference_variance, ())
     transition_variance = jnp.asarray(config.ula_step_size, dtype=anchors.dtype)
     chex.assert_shape(transition_variance, ())
-    log_reference = gaussian_log_density(final, reference_mean, reference_variance)
+    if config.proposal_family == "laplace":
+        reference_scale = jnp.asarray(config.proposal_scale, dtype=anchors.dtype)
+        chex.assert_shape(reference_scale, ())
+        log_reference = laplace_log_density(final, reference_mean, reference_scale)
+    else:
+        reference_variance = jnp.asarray(config.proposal_scale**2, dtype=anchors.dtype)
+        chex.assert_shape(reference_variance, ())
+        log_reference = gaussian_log_density(final, reference_mean, reference_variance)
     chex.assert_shape(log_reference, (batch, n_proposals))
     log_transition = gaussian_log_density(final, final_mean, transition_variance)
     chex.assert_shape(log_transition, (batch, n_proposals))
@@ -188,7 +225,15 @@ def joint_cvar_dual(
     log_weights: Array,
     config: RobustConfig,
 ) -> Array:
-    """Compute the joint-CVaR WDRO dual; inputs are state/path arrays/config and output is a scalar objective."""
+    """Compute the joint-L^p WDRO dual; inputs are state/path arrays/config and output is a scalar objective.
+
+    With config.tail_power == 1.0 this is the standard CVaR-shaped dual (L^1 norm of the
+    positive part). Larger tail_power uses an L^p norm of the positive part instead, which
+    is no longer a CVaR but penalizes large individual tail excesses more sharply. When
+    config.exact_eta is set, eta is not a dual-ascent variable but the exact per-batch
+    (1 - alpha) empirical quantile of the penalized loss (stop-gradient), following the
+    closed-form optimal eta for the p=1 case; for p != 1 this is a heuristic plug-in.
+    """
 
     chex.assert_equal_shape((pathwise_loss, transport_cost, log_weights))
     batch, n_proposals = pathwise_loss.shape
@@ -198,20 +243,72 @@ def joint_cvar_dual(
     chex.assert_shape(lambda_, ())
     penalized = pathwise_loss - lambda_ * transport_cost
     chex.assert_shape(penalized, (batch, n_proposals))
-    tail = jax.nn.relu(penalized - state.eta)
+    if config.exact_eta:
+        eta = jax.lax.stop_gradient(jnp.quantile(penalized, config.alpha))
+    else:
+        eta = state.eta
+    chex.assert_shape(eta, ())
+    tail = jax.nn.relu(penalized - eta)
     chex.assert_shape(tail, (batch, n_proposals))
     safe_tail = jnp.maximum(tail, jnp.finfo(tail.dtype).tiny)
     chex.assert_shape(safe_tail, (batch, n_proposals))
     log_tail = jnp.where(tail > 0.0, jnp.log(safe_tail), -jnp.inf)
     chex.assert_shape(log_tail, (batch, n_proposals))
-    log_weighted_tail = log_weights + log_tail
-    chex.assert_shape(log_weighted_tail, (batch, n_proposals))
-    log_tail_mean = (jax.scipy.special.logsumexp(log_weighted_tail)
-                     - jnp.log(batch * n_proposals))
-    chex.assert_shape(log_tail_mean, ())
-    weighted_tail_mean = jnp.where(
-        jnp.all(tail == 0.0), 0.0, jnp.exp(log_tail_mean))
-    chex.assert_shape(weighted_tail_mean, ())
-    objective = lambda_ * config.rho + state.eta + weighted_tail_mean / (1.0 - config.alpha)
+    log_weighted_tail_power = log_weights + config.tail_power * log_tail
+    chex.assert_shape(log_weighted_tail_power, (batch, n_proposals))
+    log_tail_power_mean = (jax.scipy.special.logsumexp(log_weighted_tail_power)
+                           - jnp.log(batch * n_proposals))
+    chex.assert_shape(log_tail_power_mean, ())
+    weighted_tail_norm = jnp.where(
+        jnp.all(tail == 0.0), 0.0, jnp.exp(log_tail_power_mean / config.tail_power))
+    chex.assert_shape(weighted_tail_norm, ())
+    objective = lambda_ * config.rho + eta + weighted_tail_norm / (1.0 - config.alpha)
+    chex.assert_shape(objective, ())
+    return objective
+
+
+def per_sample_cvar_dual(
+    state: RobustState,
+    pathwise_loss: Array,
+    transport_cost: Array,
+    log_weights: Array,
+    config: RobustConfig,
+) -> Array:
+    """Compute the conditional-L^p WDRO dual; inputs are state/path arrays/config and output is a scalar objective.
+
+    Implements the conditional (per-sample) constraint from note_wdro_solve.typ's
+    @conditional-dual, as opposed to joint_cvar_dual's single shared threshold
+    (@joint-dual): every anchor xi gets its own eta(xi), computed exactly as the
+    (1 - alpha) empirical quantile of that anchor's own proposal batch (stop-gradient).
+    There is no persistent per-sample dual variable to learn (anchors change every
+    step), so eta is always computed on the fly here regardless of config.exact_eta.
+    """
+
+    chex.assert_equal_shape((pathwise_loss, transport_cost, log_weights))
+    batch, n_proposals = pathwise_loss.shape
+    chex.assert_shape(state.raw_lambda, ())
+    lambda_ = jax.nn.softplus(state.raw_lambda)
+    chex.assert_shape(lambda_, ())
+    penalized = pathwise_loss - lambda_ * transport_cost
+    chex.assert_shape(penalized, (batch, n_proposals))
+    eta = jax.lax.stop_gradient(jnp.quantile(penalized, config.alpha, axis=1))
+    chex.assert_shape(eta, (batch,))
+    tail = jax.nn.relu(penalized - eta[:, None])
+    chex.assert_shape(tail, (batch, n_proposals))
+    safe_tail = jnp.maximum(tail, jnp.finfo(tail.dtype).tiny)
+    chex.assert_shape(safe_tail, (batch, n_proposals))
+    log_tail = jnp.where(tail > 0.0, jnp.log(safe_tail), -jnp.inf)
+    chex.assert_shape(log_tail, (batch, n_proposals))
+    log_weighted_tail_power = log_weights + config.tail_power * log_tail
+    chex.assert_shape(log_weighted_tail_power, (batch, n_proposals))
+    log_tail_power_mean = (jax.scipy.special.logsumexp(log_weighted_tail_power, axis=1)
+                           - jnp.log(n_proposals))
+    chex.assert_shape(log_tail_power_mean, (batch,))
+    weighted_tail_norm = jnp.where(
+        jnp.all(tail == 0.0, axis=1), 0.0, jnp.exp(log_tail_power_mean / config.tail_power))
+    chex.assert_shape(weighted_tail_norm, (batch,))
+    per_sample = eta + weighted_tail_norm / (1.0 - config.alpha)
+    chex.assert_shape(per_sample, (batch,))
+    objective = lambda_ * config.rho + jnp.mean(per_sample)
     chex.assert_shape(objective, ())
     return objective

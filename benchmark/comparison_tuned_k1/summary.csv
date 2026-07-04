@@ -1,0 +1,4 @@
+mode,learned,objective_learning,risk_improving,tail_calibrated,proposal_healthy,initial_native_objective,trained_native_objective,native_improvement_fraction,validation_cvar_improvement_fraction,validation_stop_loss_improvement_fraction,trained_active_tail_fraction,trained_normalized_ess,finite_nonzero_grad_fraction,strategy_parameter_distance,lambda,eta
+nominal,True,True,True,True,True,21.713838577270508,2.3030316829681396,0.8939371463607133,0.6066236698484866,0.13947782714886856,,,1.0,1.896765331589099,,
+entropic,True,True,True,True,True,0.02078290283679962,-1.0018689632415771,49.2064017288095,-0.10617395569485148,0.07592964612244665,,0.34408968687057495,1.0,1.337502358475727,2.2308099269866943,0.0
+joint_cvar,True,True,True,True,True,2.248753547668457,1.3883583545684814,0.3826098213350444,0.340902439177598,0.1316850260072969,0.0262451171875,0.3440555930137634,1.0,1.2639567129337372,1.0502949953079224,1.2176363468170166

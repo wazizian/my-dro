@@ -55,6 +55,7 @@ class LearningBenchmarkConfig:
     ula_step_size: float = 0.0025
     rho: float = 0.075
     kl_epsilon: float = 0.1
+    alpha: float = 0.95
     seed: int = 0
     output_dir: str = "benchmark/learning_smoke_k0"
 
@@ -77,7 +78,7 @@ def experiment_config(mode: Mode, benchmark: LearningBenchmarkConfig) -> Config:
         rho=benchmark.rho,
         kl_epsilon=benchmark.kl_epsilon,
         tau=0.0,
-        alpha=0.95,
+        alpha=benchmark.alpha,
         proposal_samples=benchmark.proposal_samples,
         proposal_scale=benchmark.proposal_scale,
         ula_steps=benchmark.ula_steps,
@@ -86,7 +87,7 @@ def experiment_config(mode: Mode, benchmark: LearningBenchmarkConfig) -> Config:
         initial_lambda=1.0,
         initial_eta=0.0,
     )
-    return Config(market=market, training=training, robust=robust, epsilon=0.0, alpha=0.95)
+    return Config(market=market, training=training, robust=robust, epsilon=0.0, alpha=benchmark.alpha)
 
 
 def initial_state_and_data(
