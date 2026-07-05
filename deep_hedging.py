@@ -22,6 +22,7 @@ from wdro import (
     entropic_dual,
     joint_cvar_dual,
     per_sample_cvar_dual,
+    relaxed_kl_cvar_dual,
     quadratic_transport_cost,
     sample_langevin_proposal,
 )
@@ -561,7 +562,8 @@ def robust_hedging_loss(
         chex.assert_shape(cost, ())
         penalized = proposed_loss[0] - lambda_ * cost
         chex.assert_shape(penalized, ())
-        temper = robust_config.objective == "entropic" or robust_config.ula_temper
+        temper = (robust_config.objective in ("entropic", "relaxed_kl_cvar")
+                  or robust_config.ula_temper)
         score = penalized / temperature if temper else penalized
         chex.assert_shape(score, ())
         return score
@@ -593,6 +595,9 @@ def robust_hedging_loss(
             robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
     elif robust_config.objective == "per_sample_cvar":
         objective = per_sample_cvar_dual(
+            robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
+    elif robust_config.objective == "relaxed_kl_cvar":
+        objective = relaxed_kl_cvar_dual(
             robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
     else:
         objective = joint_cvar_dual(

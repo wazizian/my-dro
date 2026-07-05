@@ -18,7 +18,7 @@ class RobustConfig:
     """Configure a WDRO dual and proposal; inputs are scalar hyperparameters."""
 
     enabled: bool = False
-    objective: Literal["entropic", "joint_cvar", "per_sample_cvar"] = "entropic"
+    objective: Literal["entropic", "joint_cvar", "per_sample_cvar", "relaxed_kl_cvar"] = "entropic"
     rho: float = 0.1
     kl_epsilon: float = 0.1
     tau: float = 0.0
@@ -36,6 +36,7 @@ class RobustConfig:
     tail_power: float = 1.0
     exact_eta: bool = False
     ula_temper: bool = False
+    anchor_mix_prob: float = 0.0
 
 
 class RobustState(eqx.Module):
@@ -116,8 +117,13 @@ def sample_langevin_proposal(
     if (config.proposal_scale <= 0.0 or config.ula_step_size <= 0.0
             or config.ula_gradient_clip <= 0.0):
         raise ValueError("proposal scale, ULA step size, and gradient clip must be positive")
-    keys = jax.random.split(key, n_steps + 1)
-    chex.assert_shape(keys, (n_steps + 1, 2))
+    if not 0.0 <= config.anchor_mix_prob <= 1.0:
+        raise ValueError("anchor_mix_prob must be in [0, 1]")
+    if config.anchor_mix_prob > 0.0 and n_steps > 0:
+        raise ValueError("anchor_mix_prob is only supported with ula_steps == 0")
+    n_key_slots = n_steps + 2 if config.anchor_mix_prob > 0.0 else n_steps + 1
+    keys = jax.random.split(key, n_key_slots)
+    chex.assert_shape(keys, (n_key_slots, 2))
     if config.proposal_family == "laplace":
         initial_noise = jax.random.laplace(keys[0], (batch, n_proposals, dimension), dtype=anchors.dtype)
     else:
@@ -128,6 +134,13 @@ def sample_langevin_proposal(
     if n_steps == 0:
         log_weights = jnp.zeros((batch, n_proposals), dtype=anchors.dtype)
         chex.assert_shape(log_weights, (batch, n_proposals))
+        if config.anchor_mix_prob > 0.0:
+            stay_key = keys[-1]
+            stay_mask = jax.random.bernoulli(
+                stay_key, config.anchor_mix_prob, (batch, n_proposals, 1))
+            chex.assert_shape(stay_mask, (batch, n_proposals, 1))
+            initial = jnp.where(stay_mask, anchors[:, None, :], initial)
+            chex.assert_shape(initial, (batch, n_proposals, dimension))
         samples = jax.lax.stop_gradient(initial)
         chex.assert_shape(samples, (batch, n_proposals, dimension))
         return samples, log_weights
@@ -263,6 +276,58 @@ def joint_cvar_dual(
         jnp.all(tail == 0.0), 0.0, jnp.exp(log_tail_power_mean / config.tail_power))
     chex.assert_shape(weighted_tail_norm, ())
     objective = lambda_ * config.rho + eta + weighted_tail_norm / (1.0 - config.alpha)
+    chex.assert_shape(objective, ())
+    return objective
+
+
+def relaxed_kl_cvar_dual(
+    state: RobustState,
+    pathwise_loss: Array,
+    transport_cost: Array,
+    log_weights: Array,
+    config: RobustConfig,
+) -> Array:
+    """Compute the relaxed-marginal KL+L^p WDRO dual; inputs are state/path arrays/config, output scalar.
+
+    Implements note_wdro_solve.typ's @relaxed-kl-dual: the per-anchor entropic-smoothed
+    value h_lambda(xi) (same inner log-sum-exp as entropic_dual) is wrapped in a joint-style
+    single shared eta and an L^p(P) norm of the positive part over the batch, combining KL
+    regularization within each anchor's proposal with a CVaR-style constraint across anchors.
+    """
+
+    chex.assert_equal_shape((pathwise_loss, transport_cost, log_weights))
+    batch, n_proposals = pathwise_loss.shape
+    chex.assert_shape(state.raw_lambda, ())
+    chex.assert_shape(state.eta, ())
+    lambda_ = jax.nn.softplus(state.raw_lambda)
+    chex.assert_shape(lambda_, ())
+    temperature = config.kl_epsilon + lambda_ * config.tau
+    chex.assert_shape(temperature, ())
+    penalized = pathwise_loss - lambda_ * transport_cost
+    chex.assert_shape(penalized, (batch, n_proposals))
+    scores = penalized / temperature + log_weights
+    chex.assert_shape(scores, (batch, n_proposals))
+    inner = jax.scipy.special.logsumexp(scores, axis=1) - jnp.log(n_proposals)
+    chex.assert_shape(inner, (batch,))
+    h_lambda = temperature * inner
+    chex.assert_shape(h_lambda, (batch,))
+    if config.exact_eta:
+        eta = jax.lax.stop_gradient(jnp.quantile(h_lambda, config.alpha))
+    else:
+        eta = state.eta
+    chex.assert_shape(eta, ())
+    tail = jax.nn.relu(h_lambda - eta)
+    chex.assert_shape(tail, (batch,))
+    safe_tail = jnp.maximum(tail, jnp.finfo(tail.dtype).tiny)
+    chex.assert_shape(safe_tail, (batch,))
+    log_tail = jnp.where(tail > 0.0, jnp.log(safe_tail), -jnp.inf)
+    chex.assert_shape(log_tail, (batch,))
+    log_tail_power_mean = (jax.scipy.special.logsumexp(config.tail_power * log_tail)
+                           - jnp.log(batch))
+    chex.assert_shape(log_tail_power_mean, ())
+    tail_norm = jnp.where(jnp.all(tail == 0.0), 0.0, jnp.exp(log_tail_power_mean / config.tail_power))
+    chex.assert_shape(tail_norm, ())
+    objective = lambda_ * config.rho + eta + tail_norm / (1.0 - config.alpha)
     chex.assert_shape(objective, ())
     return objective
 

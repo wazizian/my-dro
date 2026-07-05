@@ -1,5 +1,7 @@
 """Pytest coverage for WDRO duals and augmented-space ULA proposals."""
 
+import dataclasses
+
 import chex
 import equinox as eqx
 import jax
@@ -13,6 +15,7 @@ from wdro import (
     entropic_dual,
     joint_cvar_dual,
     quadratic_transport_cost,
+    relaxed_kl_cvar_dual,
     sample_langevin_proposal,
 )
 
@@ -70,6 +73,54 @@ def test_langevin_proposal_shapes_weights_and_determinism(n_steps):
         np.testing.assert_array_equal(log_weights, 0.0)
     else:
         assert bool(jnp.any(log_weights != 0.0))
+
+
+def test_anchor_mix_prob_one_returns_anchor_everywhere():
+    """Verify anchor_mix_prob=1 collapses every proposal sample onto its anchor."""
+
+    anchors = jnp.asarray([[0.0, 1.0], [2.0, -1.0]])
+    config = RobustConfig(proposal_samples=8, proposal_scale=0.7,
+                          ula_steps=0, anchor_mix_prob=1.0)
+
+    def log_target(anchor, sample):
+        return -0.5 * jnp.sum(jnp.square(sample - anchor))
+
+    key = jax.random.PRNGKey(7)
+    samples, log_weights = sample_langevin_proposal(key, anchors, log_target, config)
+    chex.assert_shape(samples, (2, 8, 2))
+    np.testing.assert_array_equal(log_weights, 0.0)
+    np.testing.assert_allclose(samples, jnp.broadcast_to(anchors[:, None, :], samples.shape))
+
+
+def test_anchor_mix_prob_partial_mixes_anchor_and_noise():
+    """Verify 0<anchor_mix_prob<1 yields some samples exactly at anchor and some perturbed."""
+
+    anchors = jnp.asarray([[0.0, 1.0]])
+    config = RobustConfig(proposal_samples=64, proposal_scale=0.7,
+                          ula_steps=0, anchor_mix_prob=0.5)
+
+    def log_target(anchor, sample):
+        return -0.5 * jnp.sum(jnp.square(sample - anchor))
+
+    key = jax.random.PRNGKey(11)
+    samples, _ = sample_langevin_proposal(key, anchors, log_target, config)
+    at_anchor = jnp.all(jnp.isclose(samples, anchors[:, None, :]), axis=-1)
+    n_at_anchor = int(jnp.sum(at_anchor))
+    assert 10 < n_at_anchor < 54
+
+
+def test_anchor_mix_prob_rejects_positive_ula_steps():
+    """Verify anchor_mix_prob>0 with ula_steps>0 raises, since mixing is only defined for k=0."""
+
+    anchors = jnp.asarray([[0.0, 1.0]])
+    config = RobustConfig(proposal_samples=4, proposal_scale=0.7,
+                          ula_steps=1, ula_step_size=0.1, anchor_mix_prob=0.5)
+
+    def log_target(anchor, sample):
+        return -0.5 * jnp.sum(jnp.square(sample - anchor))
+
+    with pytest.raises(ValueError):
+        sample_langevin_proposal(jax.random.PRNGKey(3), anchors, log_target, config)
 
 
 @pytest.mark.parametrize("n_steps", [0, 1, 2])
@@ -148,7 +199,45 @@ def test_joint_cvar_dual_uses_one_scalar_eta_and_joint_expectation():
     np.testing.assert_allclose(objective, expected, rtol=2e-6)
 
 
-@pytest.mark.parametrize("objective", ["entropic", "joint_cvar"])
+def test_relaxed_kl_cvar_dual_matches_manual_h_lambda_wrap():
+    """Verify relaxed-kl-cvar wraps the per-anchor entropic h_lambda in a joint L^1 tail."""
+
+    lambda_value = 0.3
+    eta = jnp.asarray(0.5)
+    state = RobustState(inverse_softplus(lambda_value), eta, jnp.zeros((0,)), jnp.ones((0,)))
+    config = RobustConfig(objective="relaxed_kl_cvar", rho=0.2, kl_epsilon=0.6, tau=0.1, alpha=0.8)
+    losses = jnp.asarray([[1.0, 2.0], [-1.0, 3.0]])
+    costs = jnp.asarray([[0.0, 0.5], [1.0, 0.25]])
+    log_weights = jnp.log(jnp.asarray([[0.8, 1.2], [1.5, 0.5]]))
+    objective = relaxed_kl_cvar_dual(state, losses, costs, log_weights, config)
+    temperature = config.kl_epsilon + lambda_value * config.tau
+    scores = (np.asarray(losses) - lambda_value * np.asarray(costs)) / temperature
+    inner = np.log(np.mean(np.exp(scores) * np.exp(np.asarray(log_weights)), axis=1))
+    h_lambda = temperature * inner
+    expected = lambda_value * config.rho + float(eta) + np.mean(
+        np.maximum(h_lambda - float(eta), 0.0)) / (1.0 - config.alpha)
+    np.testing.assert_allclose(objective, expected, rtol=2e-6)
+
+
+def test_relaxed_kl_cvar_dual_reduces_to_entropic_when_eta_below_min_h_lambda():
+    """Verify a very negative eta makes every h_lambda(xi) fall in the tail, recovering the entropic mean."""
+
+    lambda_value = 0.3
+    eta = jnp.asarray(-100.0)
+    state = RobustState(inverse_softplus(lambda_value), eta, jnp.zeros((0,)), jnp.ones((0,)))
+    config = RobustConfig(objective="relaxed_kl_cvar", rho=0.2, kl_epsilon=0.6, tau=0.1, alpha=0.0)
+    losses = jnp.asarray([[1.0, 2.0], [-1.0, 3.0]])
+    costs = jnp.asarray([[0.0, 0.5], [1.0, 0.25]])
+    log_weights = jnp.zeros((2, 2))
+    entropic_config = dataclasses.replace(config, objective="entropic")
+    entropic_state = RobustState(inverse_softplus(lambda_value), jnp.asarray(0.0),
+                                  jnp.zeros((0,)), jnp.ones((0,)))
+    expected = entropic_dual(entropic_state, losses, costs, log_weights, entropic_config)
+    objective = relaxed_kl_cvar_dual(state, losses, costs, log_weights, config)
+    np.testing.assert_allclose(objective, expected, rtol=1e-5)
+
+
+@pytest.mark.parametrize("objective", ["entropic", "joint_cvar", "relaxed_kl_cvar"])
 def test_jitted_dual_has_finite_parameter_gradients(objective):
     """Verify each top-level-jitted dual has finite gradients in lambda and scalar eta."""
 
@@ -157,7 +246,12 @@ def test_jitted_dual_has_finite_parameter_gradients(objective):
     losses = jnp.asarray([[0.1, 0.7], [1.2, -0.4]])
     costs = jnp.asarray([[0.0, 0.2], [0.1, 0.3]])
     log_weights = jnp.zeros((2, 2))
-    dual = entropic_dual if objective == "entropic" else joint_cvar_dual
+    dual_by_objective = {
+        "entropic": entropic_dual,
+        "joint_cvar": joint_cvar_dual,
+        "relaxed_kl_cvar": relaxed_kl_cvar_dual,
+    }
+    dual = dual_by_objective[objective]
     compiled_dual = eqx.filter_jit(jax.value_and_grad(dual))
     value, gradient = compiled_dual(state, losses, costs, log_weights, config)
     chex.assert_shape(value, ())
