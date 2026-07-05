@@ -75,8 +75,15 @@ def test_langevin_proposal_shapes_weights_and_determinism(n_steps):
         assert bool(jnp.any(log_weights != 0.0))
 
 
-def test_anchor_mix_prob_one_returns_anchor_everywhere():
-    """Verify anchor_mix_prob=1 collapses every proposal sample onto its anchor."""
+def test_anchor_mix_prob_one_zeroes_out_bar_pi_weight():
+    """Verify anchor_mix_prob=1 puts an exact anchor slot first and -inf weight on the rest.
+
+    The mixture is now split analytically rather than by Bernoulli-sampling which branch each
+    proposal comes from: the dirac component is always a single deterministic extra sample at
+    the anchor (slot 0), and the remaining n_proposals slots stay genuine bar_pi draws whose
+    log-weight reflects the (1 - p) mixture mass, so at p=1 they carry -inf weight (i.e.
+    contribute nothing) without needing to literally collapse their sample values onto the anchor.
+    """
 
     anchors = jnp.asarray([[0.0, 1.0], [2.0, -1.0]])
     config = RobustConfig(proposal_samples=8, proposal_scale=0.7,
@@ -87,26 +94,39 @@ def test_anchor_mix_prob_one_returns_anchor_everywhere():
 
     key = jax.random.PRNGKey(7)
     samples, log_weights = sample_langevin_proposal(key, anchors, log_target, config)
-    chex.assert_shape(samples, (2, 8, 2))
-    np.testing.assert_array_equal(log_weights, 0.0)
-    np.testing.assert_allclose(samples, jnp.broadcast_to(anchors[:, None, :], samples.shape))
+    chex.assert_shape(samples, (2, 9, 2))
+    chex.assert_shape(log_weights, (2, 9))
+    np.testing.assert_allclose(samples[:, 0, :], anchors)
+    assert bool(jnp.all(jnp.isfinite(log_weights[:, 0])))
+    assert bool(jnp.all(jnp.isneginf(log_weights[:, 1:])))
 
 
-def test_anchor_mix_prob_partial_mixes_anchor_and_noise():
-    """Verify 0<anchor_mix_prob<1 yields some samples exactly at anchor and some perturbed."""
+def test_anchor_mix_prob_partial_matches_closed_form_mixture_weights():
+    """Verify 0<anchor_mix_prob<1 yields an exact anchor slot plus correctly-weighted bar_pi draws."""
 
     anchors = jnp.asarray([[0.0, 1.0]])
-    config = RobustConfig(proposal_samples=64, proposal_scale=0.7,
+    n_proposals = 16
+    config = RobustConfig(proposal_samples=n_proposals, proposal_scale=0.7,
                           ula_steps=0, anchor_mix_prob=0.5)
 
     def log_target(anchor, sample):
         return -0.5 * jnp.sum(jnp.square(sample - anchor))
 
     key = jax.random.PRNGKey(11)
-    samples, _ = sample_langevin_proposal(key, anchors, log_target, config)
-    at_anchor = jnp.all(jnp.isclose(samples, anchors[:, None, :]), axis=-1)
-    n_at_anchor = int(jnp.sum(at_anchor))
-    assert 10 < n_at_anchor < 54
+    samples, log_weights = sample_langevin_proposal(key, anchors, log_target, config)
+    chex.assert_shape(samples, (1, n_proposals + 1, 2))
+    chex.assert_shape(log_weights, (1, n_proposals + 1))
+    np.testing.assert_allclose(samples[:, 0, :], anchors)
+    assert bool(jnp.all(jnp.abs(samples[:, 1:, :] - anchors[:, None, :]) > 0.0))
+    total_slots = n_proposals + 1
+    expected_anchor_weight = jnp.log(0.5) + jnp.log(total_slots)
+    expected_bar_weight = jnp.log(0.5) - jnp.log(n_proposals) + jnp.log(total_slots)
+    np.testing.assert_allclose(log_weights[:, 0], expected_anchor_weight, rtol=1e-5)
+    np.testing.assert_allclose(log_weights[:, 1:], expected_bar_weight, rtol=1e-5)
+    # The two mixture components' total probability mass must sum to 1.
+    mixture_mass = jnp.exp(log_weights[:, 0]) / total_slots + jnp.sum(
+        jnp.exp(log_weights[:, 1:]), axis=1) / total_slots
+    np.testing.assert_allclose(mixture_mass, 1.0, rtol=1e-5)
 
 
 def test_anchor_mix_prob_rejects_positive_ula_steps():

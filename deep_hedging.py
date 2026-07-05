@@ -570,7 +570,7 @@ def robust_hedging_loss(
 
     proposals, log_weights = sample_langevin_proposal(
         proposal_key, anchors, log_target, robust_config)
-    n_proposals = robust_config.proposal_samples
+    n_proposals = proposals.shape[1]
     chex.assert_shape(proposals, (batch, n_proposals, dimension))
     chex.assert_shape(log_weights, (batch, n_proposals))
     flat_proposals = proposals.reshape(batch * n_proposals, dimension)
@@ -854,12 +854,10 @@ def evaluate_chunks(
             robust_value, robust_diagnostics = robust_evaluate(
                 strategy, robust_state, prices, variance, proposal_key)
             robust_losses, robust_transport, robust_log_weights = robust_diagnostics[:3]
-            chex.assert_shape(
-                robust_losses, (size, config.robust.proposal_samples))
-            chex.assert_shape(
-                robust_transport, (size, config.robust.proposal_samples))
-            chex.assert_shape(
-                robust_log_weights, (size, config.robust.proposal_samples))
+            n_proposals = robust_losses.shape[1]
+            chex.assert_shape(robust_losses, (size, n_proposals))
+            chex.assert_shape(robust_transport, (size, n_proposals))
+            chex.assert_shape(robust_log_weights, (size, n_proposals))
             log_weights_np = np.asarray(robust_log_weights)
             shifted_weights = np.exp(
                 log_weights_np - np.max(log_weights_np, axis=1, keepdims=True))

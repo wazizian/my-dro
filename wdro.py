@@ -121,7 +121,7 @@ def sample_langevin_proposal(
         raise ValueError("anchor_mix_prob must be in [0, 1]")
     if config.anchor_mix_prob > 0.0 and n_steps > 0:
         raise ValueError("anchor_mix_prob is only supported with ula_steps == 0")
-    n_key_slots = n_steps + 2 if config.anchor_mix_prob > 0.0 else n_steps + 1
+    n_key_slots = n_steps + 1
     keys = jax.random.split(key, n_key_slots)
     chex.assert_shape(keys, (n_key_slots, 2))
     if config.proposal_family == "laplace":
@@ -134,15 +134,30 @@ def sample_langevin_proposal(
     if n_steps == 0:
         log_weights = jnp.zeros((batch, n_proposals), dtype=anchors.dtype)
         chex.assert_shape(log_weights, (batch, n_proposals))
-        if config.anchor_mix_prob > 0.0:
-            stay_key = keys[-1]
-            stay_mask = jax.random.bernoulli(
-                stay_key, config.anchor_mix_prob, (batch, n_proposals, 1))
-            chex.assert_shape(stay_mask, (batch, n_proposals, 1))
-            initial = jnp.where(stay_mask, anchors[:, None, :], initial)
-            chex.assert_shape(initial, (batch, n_proposals, dimension))
-        samples = jax.lax.stop_gradient(initial)
+        samples = initial
         chex.assert_shape(samples, (batch, n_proposals, dimension))
+        if config.anchor_mix_prob > 0.0:
+            # Analytic mixture split (pi_0 = p * dirac(xi) + (1 - p) * bar_pi(.|xi)) rather than
+            # Bernoulli-sampling which branch each proposal comes from: the dirac component is
+            # exact (a single deterministic extra sample at the anchor itself, cost 0), so this
+            # spends one extra evaluation to remove the sampling variance of a stochastic mix,
+            # while every one of the n_proposals slots stays a genuine bar_pi draw.
+            total_slots = n_proposals + 1
+            anchor_sample = anchors[:, None, :]
+            chex.assert_shape(anchor_sample, (batch, 1, dimension))
+            samples = jnp.concatenate([anchor_sample, samples], axis=1)
+            chex.assert_shape(samples, (batch, total_slots, dimension))
+            anchor_log_weight = jnp.full(
+                (batch, 1), jnp.log(config.anchor_mix_prob) + jnp.log(total_slots),
+                dtype=anchors.dtype)
+            chex.assert_shape(anchor_log_weight, (batch, 1))
+            bar_log_weight = (log_weights + jnp.log1p(-config.anchor_mix_prob)
+                              - jnp.log(n_proposals) + jnp.log(total_slots))
+            chex.assert_shape(bar_log_weight, (batch, n_proposals))
+            log_weights = jnp.concatenate([anchor_log_weight, bar_log_weight], axis=1)
+            chex.assert_shape(log_weights, (batch, total_slots))
+        samples = jax.lax.stop_gradient(samples)
+        chex.assert_shape(samples, log_weights.shape + (dimension,))
         return samples, log_weights
 
     flat_anchors = jnp.repeat(anchors, n_proposals, axis=0)
