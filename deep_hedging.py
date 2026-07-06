@@ -22,6 +22,8 @@ from wdro import (
     entropic_dual,
     joint_cvar_dual,
     per_sample_cvar_dual,
+    plain_average_dual,
+    plain_cvar_of_average_dual,
     relaxed_kl_cvar_dual,
     quadratic_transport_cost,
     sample_langevin_proposal,
@@ -598,6 +600,12 @@ def robust_hedging_loss(
             robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
     elif robust_config.objective == "relaxed_kl_cvar":
         objective = relaxed_kl_cvar_dual(
+            robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
+    elif robust_config.objective == "plain_average":
+        objective = plain_average_dual(
+            robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
+    elif robust_config.objective == "plain_cvar_of_average":
+        objective = plain_cvar_of_average_dual(
             robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
     else:
         objective = joint_cvar_dual(

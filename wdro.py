@@ -18,7 +18,10 @@ class RobustConfig:
     """Configure a WDRO dual and proposal; inputs are scalar hyperparameters."""
 
     enabled: bool = False
-    objective: Literal["entropic", "joint_cvar", "per_sample_cvar", "relaxed_kl_cvar"] = "entropic"
+    objective: Literal[
+        "entropic", "joint_cvar", "per_sample_cvar", "relaxed_kl_cvar", "plain_average",
+        "plain_cvar_of_average",
+    ] = "entropic"
     rho: float = 0.1
     kl_epsilon: float = 0.1
     tau: float = 0.0
@@ -242,6 +245,74 @@ def entropic_dual(
     inner = jax.scipy.special.logsumexp(scores, axis=1) - jnp.log(n_proposals)
     chex.assert_shape(inner, (batch,))
     objective = lambda_ * config.rho + temperature * jnp.mean(inner)
+    chex.assert_shape(objective, ())
+    return objective
+
+
+def plain_average_dual(
+    state: RobustState,
+    pathwise_loss: Array,
+    transport_cost: Array,
+    log_weights: Array,
+    config: RobustConfig,
+) -> Array:
+    """Compute the plain proposal-neighborhood average; inputs are state/path arrays/config, output scalar.
+
+    Confound-isolation baseline: averages the raw pathwise loss over every (anchor, proposal)
+    pair with no worst-case tilt and no transport-cost penalty -- i.e. it sees the same
+    perturbation-kernel-augmented sample budget as entropic_dual/relaxed_kl_cvar_dual (batch *
+    n_proposals forward passes) but with none of the WDRO dual machinery, isolating whether an
+    apparent robustness edge is just an effect of more (perturbed) samples per training step.
+    transport_cost/state.raw_lambda are accepted only to match the other duals' call signature
+    and are intentionally unused.
+    """
+
+    del transport_cost, state
+    chex.assert_equal_shape((pathwise_loss, log_weights))
+    objective = jnp.mean(pathwise_loss)
+    chex.assert_shape(objective, ())
+    return objective
+
+
+def plain_cvar_of_average_dual(
+    state: RobustState,
+    pathwise_loss: Array,
+    transport_cost: Array,
+    log_weights: Array,
+    config: RobustConfig,
+) -> Array:
+    """Compute a CVaR-of-average confound control; inputs are state/path arrays/config, output scalar.
+
+    The true single-variable alternative to relaxed_kl_cvar_dual: each anchor's proposal
+    neighborhood is collapsed to a plain (self-normalized-importance-weighted) average over
+    pi_0 -- no worst-case tilt, no transport-cost penalty -- and then the *same* joint CVaR-style
+    aggregation (eta + L^1-tail-norm/(1-alpha)) used by joint_cvar_dual/relaxed_kl_cvar_dual is
+    applied across the batch of those per-anchor averages. Unlike plain_average_dual (whose
+    outer aggregation is a plain mean, matching entropic_dual's outer form rather than
+    relaxed_kl_cvar_dual's), this holds the outer risk functional fixed to the same CVaR-shaped
+    form relaxed_kl_cvar_dual and nominal's Rockafellar-Uryasev loss both use, isolating the
+    inner tilt as the only remaining difference from relaxed_kl_cvar_dual. transport_cost and
+    state.raw_lambda are accepted only for call-signature compatibility and are unused. Unlike
+    joint_cvar_dual/relaxed_kl_cvar_dual, only the standard tail_power=1.0 (true CVaR, L^1 norm
+    of the positive part) shape is implemented -- config.tail_power is not read.
+    """
+
+    del transport_cost
+    chex.assert_equal_shape((pathwise_loss, log_weights))
+    batch, n_proposals = pathwise_loss.shape
+    chex.assert_shape(state.eta, ())
+    weights = jax.nn.softmax(log_weights, axis=1)
+    chex.assert_shape(weights, (batch, n_proposals))
+    per_anchor_average = jnp.sum(weights * pathwise_loss, axis=1)
+    chex.assert_shape(per_anchor_average, (batch,))
+    if config.exact_eta:
+        eta = jax.lax.stop_gradient(jnp.quantile(per_anchor_average, config.alpha))
+    else:
+        eta = state.eta
+    chex.assert_shape(eta, ())
+    tail = jax.nn.relu(per_anchor_average - eta)
+    chex.assert_shape(tail, (batch,))
+    objective = eta + jnp.mean(tail) / (1.0 - config.alpha)
     chex.assert_shape(objective, ())
     return objective
 

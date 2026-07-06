@@ -15,6 +15,8 @@ from wdro import (
     entropic_dual,
     joint_cvar_dual,
     quadratic_transport_cost,
+    plain_average_dual,
+    plain_cvar_of_average_dual,
     relaxed_kl_cvar_dual,
     sample_langevin_proposal,
 )
@@ -257,7 +259,84 @@ def test_relaxed_kl_cvar_dual_reduces_to_entropic_when_eta_below_min_h_lambda():
     np.testing.assert_allclose(objective, expected, rtol=1e-5)
 
 
-@pytest.mark.parametrize("objective", ["entropic", "joint_cvar", "relaxed_kl_cvar"])
+def test_plain_average_dual_matches_manual_mean():
+    """Verify plain_average_dual is exactly the mean pathwise loss over anchors and proposals."""
+
+    state = RobustState(inverse_softplus(0.3), jnp.asarray(0.5), jnp.zeros((0,)), jnp.ones((0,)))
+    config = RobustConfig(objective="plain_average", rho=0.2)
+    losses = jnp.asarray([[1.0, 2.0, -3.0], [0.5, -1.5, 4.0]])
+    costs = jnp.asarray([[0.0, 0.5, 1.0], [0.2, 0.4, 0.6]])
+    log_weights = jnp.zeros((2, 3))
+    objective = plain_average_dual(state, losses, costs, log_weights, config)
+    np.testing.assert_allclose(objective, np.mean(np.asarray(losses)), rtol=1e-6)
+
+
+def test_plain_average_dual_ignores_lambda_and_transport_cost():
+    """Verify changing lambda or transport_cost leaves plain_average_dual unchanged."""
+
+    losses = jnp.asarray([[1.0, 2.0], [-1.0, 3.0]])
+    log_weights = jnp.zeros((2, 2))
+    config = RobustConfig(objective="plain_average", rho=0.2)
+    baseline_costs = jnp.zeros((2, 2))
+    baseline_state = RobustState(inverse_softplus(0.1), jnp.asarray(0.0), jnp.zeros((0,)), jnp.ones((0,)))
+    baseline = plain_average_dual(baseline_state, losses, baseline_costs, log_weights, config)
+
+    perturbed_costs = jnp.asarray([[0.0, 5.0], [10.0, 0.25]])
+    perturbed_state = RobustState(inverse_softplus(9.0), jnp.asarray(0.0), jnp.zeros((0,)), jnp.ones((0,)))
+    perturbed = plain_average_dual(perturbed_state, losses, perturbed_costs, log_weights, config)
+    np.testing.assert_allclose(baseline, perturbed, rtol=1e-6)
+
+
+def test_plain_cvar_of_average_dual_matches_manual_cvar_of_mean():
+    """Verify plain_cvar_of_average_dual is a joint CVaR over plain per-anchor proposal means."""
+
+    eta = jnp.asarray(0.4)
+    state = RobustState(inverse_softplus(0.3), eta, jnp.zeros((0,)), jnp.ones((0,)))
+    config = RobustConfig(objective="plain_cvar_of_average", rho=0.2, alpha=0.75)
+    losses = jnp.asarray([[1.0, 2.0, 0.0], [-1.0, 3.0, 5.0]])
+    costs = jnp.asarray([[0.0, 0.5, 1.0], [0.2, 0.4, 0.6]])
+    log_weights = jnp.log(jnp.asarray([[0.5, 1.0, 1.5], [1.0, 1.0, 1.0]]))
+    objective = plain_cvar_of_average_dual(state, losses, costs, log_weights, config)
+    weights = np.exp(np.asarray(log_weights))
+    weights = weights / weights.sum(axis=1, keepdims=True)
+    per_anchor_average = np.sum(weights * np.asarray(losses), axis=1)
+    expected = float(eta) + np.mean(np.maximum(per_anchor_average - float(eta), 0.0)) / (1.0 - config.alpha)
+    np.testing.assert_allclose(objective, expected, rtol=2e-6)
+
+
+def test_plain_cvar_of_average_dual_ignores_lambda_and_transport_cost():
+    """Verify changing lambda or transport_cost leaves plain_cvar_of_average_dual unchanged."""
+
+    losses = jnp.asarray([[1.0, 2.0], [-1.0, 3.0]])
+    log_weights = jnp.zeros((2, 2))
+    config = RobustConfig(objective="plain_cvar_of_average", rho=0.2, alpha=0.7)
+    baseline_costs = jnp.zeros((2, 2))
+    baseline_state = RobustState(inverse_softplus(0.1), jnp.asarray(0.6), jnp.zeros((0,)), jnp.ones((0,)))
+    baseline = plain_cvar_of_average_dual(baseline_state, losses, baseline_costs, log_weights, config)
+
+    perturbed_costs = jnp.asarray([[0.0, 5.0], [10.0, 0.25]])
+    perturbed_state = RobustState(inverse_softplus(9.0), jnp.asarray(0.6), jnp.zeros((0,)), jnp.ones((0,)))
+    perturbed = plain_cvar_of_average_dual(perturbed_state, losses, perturbed_costs, log_weights, config)
+    np.testing.assert_allclose(baseline, perturbed, rtol=1e-6)
+
+
+def test_plain_cvar_of_average_dual_exact_eta_matches_empirical_quantile():
+    """Verify exact_eta uses the (1 - alpha) empirical quantile of the per-anchor averages."""
+
+    state = RobustState(inverse_softplus(0.3), jnp.asarray(999.0), jnp.zeros((0,)), jnp.ones((0,)))
+    config = RobustConfig(objective="plain_cvar_of_average", rho=0.2, alpha=0.5, exact_eta=True)
+    losses = jnp.asarray([[1.0, 3.0], [2.0, 4.0], [-1.0, 1.0], [0.0, 0.0]])
+    costs = jnp.zeros((4, 2))
+    log_weights = jnp.zeros((4, 2))
+    objective = plain_cvar_of_average_dual(state, losses, costs, log_weights, config)
+    per_anchor_average = np.mean(np.asarray(losses), axis=1)
+    eta = np.quantile(per_anchor_average, config.alpha)
+    expected = eta + np.mean(np.maximum(per_anchor_average - eta, 0.0)) / (1.0 - config.alpha)
+    np.testing.assert_allclose(objective, expected, rtol=2e-6)
+
+
+@pytest.mark.parametrize(
+    "objective", ["entropic", "joint_cvar", "relaxed_kl_cvar", "plain_average", "plain_cvar_of_average"])
 def test_jitted_dual_has_finite_parameter_gradients(objective):
     """Verify each top-level-jitted dual has finite gradients in lambda and scalar eta."""
 
@@ -270,6 +349,8 @@ def test_jitted_dual_has_finite_parameter_gradients(objective):
         "entropic": entropic_dual,
         "joint_cvar": joint_cvar_dual,
         "relaxed_kl_cvar": relaxed_kl_cvar_dual,
+        "plain_average": plain_average_dual,
+        "plain_cvar_of_average": plain_cvar_of_average_dual,
     }
     dual = dual_by_objective[objective]
     compiled_dual = eqx.filter_jit(jax.value_and_grad(dual))
