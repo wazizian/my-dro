@@ -1,0 +1,21 @@
+error,extra,in_distribution,label,lam,market_name,n_time,objective,seed,stage,worst_extreme
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",16.8059139251709,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4405,D,74.5099868774414
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",14.355103492736816,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4406,D,58.43279266357422
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",17.796621322631836,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4403,D,88.74622344970703
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",17.44767951965332,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4409,D,68.85124969482422
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",15.444653511047363,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4400,D,40.189796447753906
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",14.633599281311035,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4408,D,50.1995964050293
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",14.438010215759277,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4401,D,66.60173797607422
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",15.885458946228027,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4404,D,53.58103942871094
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",15.961088180541992,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4407,D,79.86096954345703
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",16.162899017333984,heston_relaxed_kl_cvar,0.002,heston,60,relaxed_kl_cvar,4402,D,53.890193939208984
+,{},17.866119384765625,heston_nominal,0.0,heston,60,nominal,4403,D,70.53138732910156
+,{},17.183164596557617,heston_nominal,0.0,heston,60,nominal,4402,D,80.11906433105469
+,{},18.444244384765625,heston_nominal,0.0,heston,60,nominal,4404,D,215.94784545898438
+,{},15.63023853302002,heston_nominal,0.0,heston,60,nominal,4401,D,62.88179397583008
+,{},13.712129592895508,heston_nominal,0.0,heston,60,nominal,4406,D,138.29661560058594
+,{},16.3060359954834,heston_nominal,0.0,heston,60,nominal,4400,D,45.44931411743164
+,{},15.877555847167969,heston_nominal,0.0,heston,60,nominal,4407,D,158.58558654785156
+,{},13.976507186889648,heston_nominal,0.0,heston,60,nominal,4408,D,46.56230545043945
+,{},16.91773796081543,heston_nominal,0.0,heston,60,nominal,4405,D,60.70096206665039
+,{},15.765515327453613,heston_nominal,0.0,heston,60,nominal,4409,D,65.85694122314453

@@ -1,0 +1,19 @@
+error,extra,in_distribution,label,lam,market_name,n_time,objective,seed,stage,worst_extreme
+,{},10.99532413482666,bs_entropic,0.05,black_scholes,20,entropic,4101,B,365.3061218261719
+,{},10.442544937133789,bs_entropic,0.05,black_scholes,20,entropic,4100,B,256.38800048828125
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",5.356832027435303,bs_relaxed_kl_cvar,0.2,black_scholes,20,relaxed_kl_cvar,4100,B,290.6437072753906
+,{},9.18187141418457,bs_entropic,0.05,black_scholes,20,entropic,4102,B,336.0527648925781
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",6.463094711303711,bs_relaxed_kl_cvar,0.2,black_scholes,20,relaxed_kl_cvar,4101,B,222.3092498779297
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",5.707484245300293,bs_relaxed_kl_cvar,0.2,black_scholes,20,relaxed_kl_cvar,4102,B,257.1381530761719
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",4.526217460632324,bs_joint_cvar,0.0125,black_scholes,20,joint_cvar,4101,B,210.3658447265625
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",4.67838191986084,bs_joint_cvar,0.0125,black_scholes,20,joint_cvar,4100,B,171.0463409423828
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",4.05684232711792,bs_joint_cvar,0.0125,black_scholes,20,joint_cvar,4102,B,403.1001892089844
+,{},6.211257457733154,heston_entropic,0.32,heston,20,entropic,4100,B,14.141888618469238
+,{},6.931773662567139,heston_entropic,0.32,heston,20,entropic,4101,B,10.817873001098633
+,{},6.524954319000244,heston_entropic,0.32,heston,20,entropic,4102,B,19.558870315551758
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",5.333365440368652,heston_joint_cvar,0.0125,heston,20,joint_cvar,4102,B,8.62987995147705
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",5.538191318511963,heston_relaxed_kl_cvar,0.16,heston,20,relaxed_kl_cvar,4101,B,10.201062202453613
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",6.258309364318848,heston_joint_cvar,0.0125,heston,20,joint_cvar,4100,B,18.491552352905273
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",5.8373613357543945,heston_relaxed_kl_cvar,0.16,heston,20,relaxed_kl_cvar,4102,B,13.698442459106445
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",5.077394485473633,heston_relaxed_kl_cvar,0.16,heston,20,relaxed_kl_cvar,4100,B,12.884346961975098
+,"{'alpha': 0.9, 'exact_eta': True, 'tail_power': 1.0}",5.341800689697266,heston_joint_cvar,0.0125,heston,20,joint_cvar,4101,B,13.012784957885742
