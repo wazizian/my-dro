@@ -77,6 +77,33 @@ def test_langevin_proposal_shapes_weights_and_determinism(n_steps):
         assert bool(jnp.any(log_weights != 0.0))
 
 
+@pytest.mark.parametrize("n_steps", [1, 2])
+@pytest.mark.parametrize("use_importance_sampling", [True, False])
+def test_use_importance_sampling_toggle_gates_log_weights(n_steps, use_importance_sampling):
+    """Verify use_importance_sampling=False zeroes log_weights for k>=1 under a non-degenerate target.
+
+    The chain itself (and hence `samples`) must still run for the full k steps either way -- only
+    the reference/transition log-density-ratio correction on top of it is gated.
+    """
+
+    anchors = jnp.asarray([[0.0, 1.0], [2.0, -1.0]])
+    config = RobustConfig(proposal_samples=8, proposal_scale=0.7, ula_steps=n_steps,
+                          ula_step_size=0.2, use_importance_sampling=use_importance_sampling)
+
+    def log_target(anchor, sample):
+        return -0.5 * jnp.sum(jnp.square(sample - anchor)) + 0.2 * sample[0]
+
+    key = jax.random.PRNGKey(21)
+    samples, log_weights = sample_langevin_proposal(key, anchors, log_target, config)
+    chex.assert_shape(samples, (2, 8, 2))
+    chex.assert_shape(log_weights, (2, 8))
+    assert bool(jnp.all(jnp.isfinite(samples)))
+    if use_importance_sampling:
+        assert bool(jnp.any(log_weights != 0.0))
+    else:
+        np.testing.assert_array_equal(log_weights, 0.0)
+
+
 def test_anchor_mix_prob_one_zeroes_out_bar_pi_weight():
     """Verify anchor_mix_prob=1 puts an exact anchor slot first and -inf weight on the rest.
 

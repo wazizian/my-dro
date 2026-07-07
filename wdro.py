@@ -30,6 +30,7 @@ class RobustConfig:
     proposal_scale: float = 0.1
     proposal_family: Literal["gaussian", "laplace"] = "gaussian"
     ula_steps: int = 0
+    use_importance_sampling: bool = True
     ula_step_size: float = 0.01
     ula_gradient_clip: float = 10.0
     initial_lambda: float = 1.0
@@ -213,7 +214,10 @@ def sample_langevin_proposal(
     chex.assert_shape(log_reference, (batch, n_proposals))
     log_transition = gaussian_log_density(final, final_mean, transition_variance)
     chex.assert_shape(log_transition, (batch, n_proposals))
-    log_weights = log_reference - log_transition
+    if config.use_importance_sampling:
+        log_weights = log_reference - log_transition
+    else:
+        log_weights = jnp.zeros((batch, n_proposals), dtype=anchors.dtype)
     chex.assert_shape(log_weights, (batch, n_proposals))
     samples = jax.lax.stop_gradient(final)
     chex.assert_shape(samples, (batch, n_proposals, dimension))
