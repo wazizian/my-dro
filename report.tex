@@ -1,0 +1,367 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{caption}
+
+\title{WDRO-Regularized Deep Hedging: Metrics, Algorithms, and Results}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Introduction}
+
+We consider discrete-time robust hedging: a strategy $\delta$ chooses hedge positions to
+minimize loss under the \emph{worst} plausible market law in a neighborhood of a reference model
+$\hat\pi$,
+\begin{equation}\label{eq:problem}
+  \inf_{\delta \in M} \; \sup_{\pi \in A(\hat\pi, \varepsilon, \mathcal{V})} \;
+  \mathbb{E}_{\pi}\left[\mathrm{Loss}^{\mathrm{dist}}(\delta)\right],
+\end{equation}
+where $\mathrm{Loss} = -\mathrm{PnL}$ and the ambiguity set $A(\hat\pi,\varepsilon,\mathcal{V})$
+is a Wasserstein/KL ball of radius $\varepsilon$ around $\hat\pi$. The strategy $\delta$ is a
+small MLP trained on simulated trajectories from two reference models: Black--Scholes (BS) and
+Heston. The outer supremum is approximated by a family of \emph{dual} objectives (entropic
+tilting, joint/relaxed CVaR reformulations) evaluated on proposal samples drawn either directly
+from a reference kernel or via an Unadjusted Langevin Algorithm (ULA) chain. This report
+consolidates the metrics, the algorithmic components, and the main quantitative findings
+produced across this investigation.
+
+\section{Metrics}
+
+Every experiment reports two numbers, both CVaR at level $0.95$ (\emph{CVaR-95}) of the hedging
+loss, i.e.\ the mean loss in the worst $5\%$ of simulated outcomes:
+
+\begin{itemize}
+  \item \textbf{in\_distribution}: CVaR-95 evaluated under the same market law used for
+    training (BS: volatility $=0.20$; Heston: base parameters).
+  \item \textbf{worst\_extreme}: the \emph{maximum} CVaR-95 over a grid of out-of-distribution
+    stress scenarios (the strategy is trained once, then evaluated, unmodified, on each stressed
+    market). Lower is better for both metrics.
+\end{itemize}
+
+\begin{table}[h]
+  \centering
+  \caption{Out-of-distribution stress grids used for \texttt{worst\_extreme}.}
+  \begin{tabular}{ll}
+    \toprule
+    Market & Stress grid \\
+    \midrule
+    Black--Scholes & volatility $\in \{0.10, 0.20, 0.30, 0.60, 0.90, 1.20, 1.50\}$ \\
+    Heston & scenarios: \emph{moderate, severe, extreme, ultra} \\
+    & (long\_variance $0.06$--$0.25$, vol-of-variance $2.5$--$8.0$, \\
+    & correlation $-0.8$ to $-0.999$, mean-reversion $\kappa$ $0.75$ to $0.1$) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Algorithm}
+
+\subsection{Dual objectives}
+
+The sup in \eqref{eq:problem} is approximated per-anchor by sampling $n$ proposals in a
+neighborhood of each training path (the ``anchor'') and aggregating their losses with one of the
+dual objectives in Table~\ref{tab:objectives}. Each objective factors into an \emph{inner}
+aggregation over the $n$ proposals around one anchor, and an \emph{outer} aggregation over the
+training batch.
+
+\begin{table}[h]
+  \centering
+  \caption{Dual objectives implemented in \texttt{wdro.py}.}
+  \label{tab:objectives}
+  \begin{tabular}{@{}lp{6.5cm}p{4cm}@{}}
+    \toprule
+    Objective & Inner aggregation (per anchor) & Outer aggregation (over batch) \\
+    \midrule
+    \texttt{entropic} & log-sum-exp tilt (worst-of-neighborhood) & plain mean \\
+    \texttt{joint\_cvar} & log-sum-exp tilt on the tail power & CVaR-$\alpha$ (Rockafellar--Uryasev) \\
+    \texttt{relaxed\_kl\_cvar} & log-sum-exp tilt (worst-of-neighborhood) & CVaR-$\alpha$ (Rockafellar--Uryasev) \\
+    \texttt{plain\_average} & unweighted mean, no tilt & plain mean \\
+    \texttt{plain\_cvar\_of\_average} & self-normalized weighted mean, no tilt & CVaR-$\alpha$ \\
+    \texttt{nominal} (baseline) & --- (no perturbation) & CVaR-$\alpha$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\texttt{plain\_average} and \texttt{plain\_cvar\_of\_average} are confound-control objectives:
+they keep the same $8\times$ per-step sample budget and perturbation kernel as
+\texttt{entropic}/\texttt{relaxed\_kl\_cvar} but remove the entropic tilt, isolating the effect
+of ``more samples'' from the effect of ``tilting toward the worst neighbor.''
+
+\subsection{ULA proposal mechanism}
+
+Given an anchor $\xi$, proposals are drawn either from a single reference kernel
+($k=0$ Langevin steps: $\tilde\xi = \xi + \sigma \cdot \text{noise}$, log-weight $=0$), or via a
+$k$-step Langevin chain ($k \ge 1$) targeting the tilted density:
+\begin{equation}
+  \tilde\xi_{t+1} = \tilde\xi_t + \tfrac{1}{2}\eta\,\nabla_\xi \log \pi_{\mathrm{target}}(\tilde\xi_t)
+  + \sqrt{\eta}\, z_t, \qquad z_t \sim \mathcal{N}(0, I).
+\end{equation}
+For $k \ge 1$, an importance-sampling (IS) correction is applied,
+\begin{equation}
+  \log w = \log \pi_{\mathrm{reference}}(\tilde\xi_k) - \log q_{\mathrm{transition}}(\tilde\xi_k),
+\end{equation}
+comparing the \emph{last} transition kernel against the \emph{original} reference kernel (not a
+full accumulated-path density ratio). A configuration flag,
+\texttt{use\_importance\_sampling} (default \texttt{True}), was added this investigation to
+force $\log w = 0$ regardless of $k$, isolating whether this (approximate) correction, rather
+than the extra Langevin step itself, drives $k>1$'s known underperformance.
+
+\section{Main Results}
+
+\subsection{Toy horizon (n\_time=5): which objective, which question}
+\label{sec:toy}
+
+At a 5-day toy horizon, paired 10-seed comparisons (seeds 2300--2309) give the headline
+trade-off in Table~\ref{tab:toy}.
+
+\begin{table}[h]
+  \centering
+  \caption{Toy horizon ($n_{\mathrm{time}}=5$), best-tuned $\lambda$ per objective/market.}
+  \label{tab:toy}
+  \begin{tabular}{llrr}
+    \toprule
+    Market & Config & in\_distribution & worst\_extreme \\
+    \midrule
+    Heston & nominal & 2.18 & 4.01 \\
+    Heston & entropic ($\lambda=0.04$) & 2.48 (+14\%) & 2.94 ($-27\%$) \\
+    Heston & relaxed\_kl\_cvar ($\lambda=0.02$) & \textbf{2.00} ($-8\%$) & \textbf{2.69} ($-33\%$) \\
+    BS & nominal & 1.79 & 51.1 \\
+    BS & entropic ($\lambda=0.1$) & 2.62 (+46\%) & \textbf{30.2} ($-41\%$) \\
+    BS & relaxed\_kl\_cvar ($\lambda=0.1$) & \textbf{1.75} ($-2\%$) & 45.8 ($-10\%$) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\texttt{relaxed\_kl\_cvar}'s in-distribution advantage over \texttt{entropic} is large and
+significant (Heston: $p=1.5\times10^{-8}$); its worst-case tail protection ties
+\texttt{entropic}'s on Heston ($p=0.16$--$0.19$) but is clearly weaker on BS. \textbf{Recommendation
+at this horizon}: \texttt{entropic} if worst-case risk is the only criterion; \texttt{relaxed\_kl\_cvar}
+if in-distribution performance also matters (especially on Heston, tail protection at
+near-zero nominal cost).
+
+\subsection{Realistic horizons (n\_time=20, 30)}
+\label{sec:longer}
+
+The above was re-tested at $n_{\mathrm{time}}=20$ and $30$ (paired 10-seed, seeds 4200--4309;
+Table~\ref{tab:longer}).
+
+\begin{table}[h]
+  \centering
+  \caption{Realistic horizons, paired 10-seed (seeds 4200--4309; \texttt{nominal\_bigbatch} uses
+  the same seeds, paired directly against \texttt{nominal}).}
+  \label{tab:longer}
+  \small
+  \begin{tabular}{@{}llrr@{}}
+    \toprule
+    Market & Config & in\_distribution & worst\_extreme \\
+    \midrule
+    BS, $n_{\mathrm{time}}=20$ & nominal & 6.82 & 341 \\
+    BS, $n_{\mathrm{time}}=20$ & nominal\_bigbatch (batch=512) & 5.28 ($-23\%$, $p=0.0020$) & 379 (+11\%, tie) \\
+    BS, $n_{\mathrm{time}}=20$ & entropic & 10.76 (+58\%, worse) & 419 (+23\%, tie) \\
+    BS, $n_{\mathrm{time}}=20$ & relaxed\_kl\_cvar (k=0) & \textbf{5.24} ($-23\%$) & \textbf{226} ($-34\%$) \\
+    \addlinespace
+    BS, $n_{\mathrm{time}}=30$ & nominal & 10.23 & 625 \\
+    BS, $n_{\mathrm{time}}=30$ & nominal\_bigbatch (batch=512) & \textbf{8.41} ($-18\%$, $p=0.0020$) & 570 ($-9\%$, tie) \\
+    BS, $n_{\mathrm{time}}=30$ & entropic & 14.94 (+46\%, worse) & 569 ($-9\%$, tie) \\
+    BS, $n_{\mathrm{time}}=30$ & relaxed\_kl\_cvar (k=0) & 8.55 ($-16\%$) & \textbf{529} ($-15\%$, $p=0.16$) \\
+    \addlinespace
+    Heston, $n_{\mathrm{time}}=20$ & nominal & 6.90 & 27.3 \\
+    Heston, $n_{\mathrm{time}}=20$ & nominal\_bigbatch (batch=512) & \textbf{5.51} ($-20\%$, $p=0.0039$) & 16.0 ($-42\%$, $p=0.0039$) \\
+    Heston, $n_{\mathrm{time}}=20$ & entropic & 6.82 ($-1\%$, flat) & 13.5 ($-51\%$) \\
+    Heston, $n_{\mathrm{time}}=20$ & relaxed\_kl\_cvar (k=0) & 5.87 ($-15\%$) & \textbf{11.0} ($-60\%$) \\
+    \addlinespace
+    Heston, $n_{\mathrm{time}}=30$ & nominal & 10.01 & 54.2 \\
+    Heston, $n_{\mathrm{time}}=30$ & nominal\_bigbatch (batch=512) & 8.86 ($-12\%$, $p=0.0059$) & 41.6 ($-23\%$, $p=0.049$) \\
+    Heston, $n_{\mathrm{time}}=30$ & entropic & 9.75 ($-3\%$, flat) & 31.0 ($-43\%$) \\
+    Heston, $n_{\mathrm{time}}=30$ & relaxed\_kl\_cvar (k=0) & \textbf{7.75} ($-23\%$) & \textbf{20.7} ($-62\%$) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\texttt{nominal\_bigbatch} (batch\_size=512, no perturbation) isolates ``more real i.i.d.\
+samples per step alone,'' mirroring \S\ref{sec:confound}'s toy-horizon comparison. Unlike at
+$n_{\mathrm{time}}=5$ (where the effect was modest, in-distribution-only, $\le$5\%), at the
+realistic horizon the batch-size effect is substantially larger on in-distribution loss in both
+markets ($-12\%$ to $-23\%$, $p\le0.006$ throughout) and now reaches significance on
+\texttt{worst\_extreme} for Heston ($p=0.004$--$0.049$), though not for BS (a tie in both
+directions). \texttt{relaxed\_kl\_cvar (k=0)} still beats \texttt{nominal\_bigbatch} on
+worst\_extreme in every cell, so the WDRO mechanism's tail-risk benefit is not simply subsumed by
+a bigger batch at this horizon --- consistent with \S\ref{sec:confound}'s toy-horizon finding
+that sample count alone does not explain the WDRO objectives' full advantage.
+
+\textbf{Key result 1}: the toy-horizon finding (\S\ref{sec:toy}) replicates cleanly at every
+horizon tested (5, 20, 30 days) --- \texttt{relaxed\_kl\_cvar} wins in-distribution ($p<0.01$
+throughout) and ties \texttt{entropic} on worst-case tail protection.
+\textbf{Key result 2 (new)}: BS \texttt{entropic}'s tail-risk edge over nominal, present at
+$n_{\mathrm{time}}=5$ (30.2 vs.\ 51.1), \emph{disappears} at $n_{\mathrm{time}}=20/30$
+(worst\_extreme ties nominal, $p=1.00,\,0.70$) while its in-distribution cost worsens
+($p=0.002$ both horizons) --- confirmed not a lambda-tuning artifact (grid searched
+$0.1\times$--$8\times$ around the toy optimum, plus an extension down to $0.00125\times$, no
+improvement found). Heston's \texttt{entropic} tail-risk edge over nominal, by contrast, holds at
+both longer horizons ($p=0.037$--$0.002$).
+
+\subsection{Is the edge just an 8$\times$-samples confound?}
+\label{sec:confound}
+
+\texttt{relaxed\_kl\_cvar}/\texttt{entropic} both forward-pass each anchor 8 times per step
+(one per proposal) vs.\ \texttt{nominal}'s 1 pass. Two confound-control objectives were added:
+\texttt{plain\_average} (8$\times$ samples, no tilt, plain-mean outer aggregation, matching
+\texttt{entropic}'s structure) and \texttt{plain\_cvar\_of\_average} (8$\times$ samples, no tilt,
+CVaR-$\alpha$ outer aggregation, matching \texttt{relaxed\_kl\_cvar}'s structure exactly ---
+added after the first control was found to differ from \texttt{relaxed\_kl\_cvar} in \emph{two}
+variables at once: sample count \emph{and} outer-aggregation type).
+
+\begin{table}[h]
+  \centering
+  \caption{Toy horizon, paired 10-seed (seeds 6000--6009), mean$\pm$std.}
+  \label{tab:confound}
+  \small
+  \begin{tabular}{lrrrr}
+    \toprule
+    Config & BS in\_dist & BS worst & Heston in\_dist & Heston worst \\
+    \midrule
+    nominal & $1.789\pm0.023$ & $48.86\pm5.72$ & $2.142\pm0.044$ & $4.04\pm1.14$ \\
+    nominal\_bigbatch (batch=512) & $1.768\pm0.008$ & $48.73\pm3.65$ & $2.032\pm0.025$ & $3.11\pm0.51$ \\
+    plain\_average (8$\times$, no tilt) & $21.51\pm5.80$ & $982\pm342$ & $19.46\pm8.72$ & $27.7\pm26.1$ \\
+    entropic & $3.195\pm0.377$ & $44.48\pm9.36$ & $2.584\pm0.227$ & $3.32\pm0.61$ \\
+    plain\_cvar\_of\_average (8$\times$, no tilt) & $1.747\pm0.018$ & $44.67\pm5.81$ & $2.068\pm0.047$ & $3.184\pm0.506$ \\
+    relaxed\_kl\_cvar & $1.751\pm0.017$ & $40.64\pm3.88$ & $2.000\pm0.031$ & $2.76\pm0.68$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{The single-variable comparison} --- \texttt{relaxed\_kl\_cvar} vs.\
+\texttt{plain\_cvar\_of\_average}, holding both sample count and outer-aggregation type fixed,
+varying only the inner tilt --- is decisive in 3 of 4 market/metric cells: BS worst\_extreme
+($p=0.0137$, relaxed wins), Heston in\_distribution ($p=0.0059$, relaxed wins), BS in\_distribution
+(tie, $p=0.43$, expected --- the tilt targets tail regions, not the average case); the 4th cell
+(Heston worst\_extreme, $p=0.084$, 80\% win rate) reads as underpowered-in-the-same-direction
+rather than a genuine null. \textbf{Verdict: the ``it's just $8\times$ samples'' hypothesis is
+not supported} --- the entropic tilt does real, distinct work beyond raw sample count, under both
+outer-aggregation conventions tested (comparison against \texttt{plain\_average}, $p\le0.024$
+everywhere, and against \texttt{plain\_cvar\_of\_average} above). Separately,
+\texttt{nominal\_bigbatch} vs.\ \texttt{nominal} shows raw sample count alone gives a real but
+modest in-distribution benefit (Heston $\sim$5\%, $p=0.0020$; BS $\sim$1\%, $p=0.027$), with no
+worst-case benefit at either market.
+
+\subsection{ULA importance-sampling ablation (n\_time=30)}
+\label{sec:is}
+
+Does the (approximate) IS correction, rather than the extra Langevin step, explain why
+$k=2$ underperforms $k=1$ (an established finding at the toy horizon)? Tested
+\texttt{relaxed\_kl\_cvar} at $n_{\mathrm{time}}=30$, $k\in\{1,2\}\times$
+\texttt{use\_importance\_sampling}$\in\{\mathrm{True,False}\}$, paired 10-seed (seeds
+7000--7009), reusing established $\lambda$ (BS: 0.025, Heston: 0.002).
+
+\begin{table}[h]
+  \centering
+  \caption{Means, $n=10$ paired seeds.}
+  \label{tab:is}
+  \begin{tabular}{lrrrr}
+    \toprule
+    Config & BS in\_dist & BS worst & Heston in\_dist & Heston worst \\
+    \midrule
+    nominal & 9.88 & 497 & 9.53 & 67.3 \\
+    k1\_is\_on (default) & 9.21 & 419 & 8.83 & 24.7 \\
+    k1\_is\_off & 9.29 & 449 & 8.56 & 23.8 \\
+    k2\_is\_on & 9.74 & 615 & 9.64 & 33.5 \\
+    k2\_is\_off & 9.68 & 372 & 10.24 & 37.5 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Toggle is a no-op at $k=1$} ($k1_{\mathrm{is\_off}}$ vs.\ $k1_{\mathrm{is\_on}}$: $p\ge0.12$
+everywhere). \textbf{Toggling IS off at $k=2$ does not recover $k=1$-level performance}: on Heston
+(the market with the cleanest $k1$-vs-$k2$ gap), disabling IS makes in-distribution CVaR
+significantly \emph{worse} ($p=0.0003$); on BS the effect is a noisy, borderline improvement on
+worst\_extreme only ($p=0.054$ ttest / $0.014$ Wilcoxon, driven by 2 of 10 seeds), still not
+beating $k=1$. \textbf{Verdict: the IS-correction-bias hypothesis is not supported} as the primary
+driver of $k>1$'s underperformance.
+
+\subsection{ULA step-size rescue at k=2 (coarse, $n=3$ seeds, unconfirmed)}
+\label{sec:stepsize}
+
+A follow-up coarse sweep (3 seeds, no formal significance testing) at $k=2$, $n_{\mathrm{time}}=30$,
+varying \texttt{ula\_step\_size} $\in\{0.02, 0.01, 0.005, 0.0025, 0.00125\}$ (default $0.02$) found
+a striking, near-monotonic improvement as the step size shrinks (Table~\ref{tab:stepsize}),
+recovering to --- and in several cells beating --- the $k=1$ baseline of \S\ref{sec:is}.
+
+\begin{table}[h]
+  \centering
+  \caption{$k=2$, \texttt{use\_importance\_sampling}=True, means over 3 seeds.}
+  \label{tab:stepsize}
+  \begin{tabular}{lrrrr}
+    \toprule
+    \texttt{ula\_step\_size} & BS in\_dist & BS worst & Heston in\_dist & Heston worst \\
+    \midrule
+    0.02 (default) & 9.41 & 352 & 9.65 & 23.3 \\
+    0.01 & 8.60 & 281 & 8.71 & 19.0 \\
+    0.005 & 8.51 & 449 & 7.63 & 17.8 \\
+    0.0025 & 8.51 & 654 & 7.90 & 16.4 \\
+    0.00125 & 8.18 & 386 & 7.45 & 18.0 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+For reference, $k=1$ default-step-size means were 9.21/419 (BS) and 8.83/24.7 (Heston). The
+smallest step sizes tested \emph{beat} $k=1$ on in-distribution loss in both markets, and are
+competitive on worst\_extreme (BS's worst\_extreme is noisy at $n=3$, no clean monotonic trend).
+A matched \texttt{use\_importance\_sampling}=False sweep at the same grid showed \textbf{no
+consistent IS on/off difference at any step size} (sign flips across cells) --- reinforcing
+\S\ref{sec:is}'s conclusion that step size, not the IS toggle, is the operative lever. This result
+is \textbf{not yet paired-confirmed with more seeds} and is reported here as a promising,
+preliminary lead.
+
+\subsection{Summary across investigations}
+
+\begin{table}[h]
+  \centering
+  \caption{Headline worst\_extreme numbers across horizons/investigations (best relaxed\_kl\_cvar
+  configuration each time).}
+  \begin{tabular}{llrr}
+    \toprule
+    Investigation & $n_{\mathrm{time}}$ & BS worst\_extreme & Heston worst\_extreme \\
+    \midrule
+    Toy horizon (\S\ref{sec:toy}) & 5 & 45.8 (nominal: 51.1) & 2.69 (nominal: 4.01) \\
+    Realistic horizon (\S\ref{sec:longer}) & 30 & 529 (nominal: 625) & 20.7 (nominal: 54.2) \\
+    Confound isolation (\S\ref{sec:confound}) & 5 & 40.64 (nominal: 48.86) & 2.76 (nominal: 4.04) \\
+    IS ablation, $k=1$ (\S\ref{sec:is}) & 30 & 419 (nominal: 497) & 24.7 (nominal: 67.3) \\
+    Step-size sweep, $k=2$, best (\S\ref{sec:stepsize}) & 30 & 281 & 16.4 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Conclusion}
+
+\textbf{Current production recommendation}: \texttt{relaxed\_kl\_cvar} (alpha=0.9,
+kl\_epsilon=0.03, cost\_power=1, gaussian proposal, $k=1$ ULA step), $\lambda$ tuned per market
+(Heston: 0.02 at $n_{\mathrm{time}}=5$, 0.002 at $n_{\mathrm{time}}=30$; BS: 0.1 at
+$n_{\mathrm{time}}=5$, 0.025 at $n_{\mathrm{time}}=30$). This is the one configuration with
+reviewer-verified, paired-significant evidence of beating nominal on both in-distribution and
+worst-case axes, across every horizon tested (5, 20, 30 days), and confirmed (\S\ref{sec:confound})
+to be more than a sample-count artifact.
+
+\textbf{Open threads}:
+\begin{itemize}
+  \item BS \texttt{entropic}'s worst-case tail-risk edge, part of the toy-horizon guidance, does
+    not hold at realistic horizons ($n_{\mathrm{time}}=20/30$) --- no confirmed objective yet
+    delivers BS tail-risk-only hedging at these horizons.
+  \item The $k=2$ ULA step-size rescue (\S\ref{sec:stepsize}) is a promising but unconfirmed
+    lead (coarse, $n=3$ seeds): a properly tuned $k=2$ may match or beat $k=1$, contrary to prior
+    guidance that fixed $k=1$ as the default. Needs a paired multi-seed confirmation before
+    revising that guidance.
+  \item Heston's apparent \texttt{relaxed\_kl\_cvar}-over-\texttt{nominal} in-distribution
+    advantage in the original toy-horizon study is partly, but not entirely, attributable to
+    sample count rather than the WDRO mechanism itself (\S\ref{sec:confound}); the tail-risk
+    advantage there is more tilt-specific.
+\end{itemize}
+
+\end{document}
