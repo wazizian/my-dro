@@ -34,6 +34,51 @@ from a reference kernel or via an Unadjusted Langevin Algorithm (ULA) chain. Thi
 consolidates the metrics, the algorithmic components, and the main quantitative findings
 produced across this investigation.
 
+\subsection{Market models}
+
+\textbf{Black--Scholes.} The stock follows exact geometric Brownian motion, simulated
+without discretization error:
+\begin{equation}\label{eq:bs-sde}
+  dS_t = \sigma S_t \, dW_t, \qquad
+  S_{t+\Delta t} = S_t \exp\!\left(-\tfrac{1}{2}\sigma^2 \Delta t + \sigma\sqrt{\Delta t}\,Z_t\right),
+  \quad Z_t \sim \mathcal N(0,1).
+\end{equation}
+
+\textbf{Heston.} Stochastic-variance model, with the CIR variance process sampled exactly
+(noncentral chi-square via a Poisson-mixture-of-gammas representation, not an Euler
+discretization) and the log-stock update using the standard conditional-on-variance-path
+decomposition:
+\begin{align}
+  dV_t &= \kappa(\theta - V_t)\,dt + \xi \sqrt{V_t}\, dW^V_t, \label{eq:heston-var}\\
+  dS_t &= \sqrt{V_t}\, S_t \left(\rho\, dW^V_t + \sqrt{1-\rho^2}\, dW^\perp_t\right), \label{eq:heston-stock}
+\end{align}
+where $\kappa$ is mean-reversion speed, $\theta$ the long-run variance, $\xi$ the
+vol-of-variance, and $\rho$ the spot-variance correlation. The stock update uses the
+piecewise-constant (left-endpoint) integrated-variance approximation
+$\int_t^{t+\Delta t} V_s\,ds \approx V_t \Delta t$ within each daily step; the variance
+transition itself is exact.
+
+\begin{table}[h]
+  \centering
+  \caption{Default \texttt{MarketConfig} parameters (both models share spot/strike/horizon).}
+  \label{tab:market-defaults}
+  \begin{tabular}{llrl}
+    \toprule
+    Parameter & Symbol & Default & Applies to \\
+    \midrule
+    spot & $S_0$ & 100.0 & both \\
+    strike & $K$ & 100.0 & both \\
+    horizon & $T$ & $n_{\mathrm{time}}/365$ (e.g.\ $30/365$) & both \\
+    volatility & $\sigma$ & 0.20 & Black--Scholes \\
+    mean-reversion & $\kappa$ & 1.0 & Heston \\
+    long-run variance & $\theta$ & 0.04 & Heston \\
+    vol-of-variance & $\xi$ & 2.0 & Heston \\
+    correlation & $\rho$ & $-0.7$ & Heston \\
+    initial variance & $V_0$ & 0.04 & Heston \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
 \section{Metrics}
 
 Every experiment reports two numbers, both CVaR at level $0.95$ (\emph{CVaR-95}) of the hedging
@@ -49,15 +94,38 @@ loss, i.e.\ the mean loss in the worst $5\%$ of simulated outcomes:
 
 \begin{table}[h]
   \centering
-  \caption{Out-of-distribution stress grids used for \texttt{worst\_extreme}.}
-  \begin{tabular}{ll}
+  \caption{Black--Scholes stress grid used for \texttt{worst\_extreme} (volatility $\sigma$;
+  in\_distribution value $0.20$ underlined).}
+  \begin{tabular}{l}
     \toprule
-    Market & Stress grid \\
+    $\sigma \in \{0.10,\ \underline{0.20},\ 0.30,\ 0.60,\ 0.90,\ 1.20,\ 1.50\}$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Each Heston stress scenario overrides all four model parameters at once (not a 1-D grid over a
+single parameter): mean-reversion $\kappa$ and vol-of-variance $\xi$ move in the direction that
+makes the variance process more volatile and slower to revert, long-run variance $\theta$ rises
+(shifting the whole variance level up), and correlation $\rho$ moves further negative (steeper
+leverage effect, i.e.\ a bigger stock drop coincides with a bigger variance spike). The four
+named scenarios are nested in severity: \emph{moderate} $\to$ \emph{ultra} monotonically worsens
+every parameter simultaneously.
+
+\begin{table}[h]
+  \centering
+  \caption{Heston stress scenarios used for \texttt{worst\_extreme} (default row is
+  in\_distribution; each stress row overrides all four columns simultaneously).}
+  \label{tab:heston-stress}
+  \small
+  \begin{tabular}{@{}lrrrr@{}}
+    \toprule
+    Scenario & $\theta$ (long-run var.) & $\xi$ (vol-of-var.) & $\rho$ (corr.) & $\kappa$ (mean-rev.) \\
     \midrule
-    Black--Scholes & volatility $\in \{0.10, 0.20, 0.30, 0.60, 0.90, 1.20, 1.50\}$ \\
-    Heston & scenarios: \emph{moderate, severe, extreme, ultra} \\
-    & (long\_variance $0.06$--$0.25$, vol-of-variance $2.5$--$8.0$, \\
-    & correlation $-0.8$ to $-0.999$, mean-reversion $\kappa$ $0.75$ to $0.1$) \\
+    default (in\_distribution) & 0.04 & 2.0 & $-0.7$ & 1.0 \\
+    moderate & 0.06 & 2.5 & $-0.8$ & 0.75 \\
+    severe   & 0.08 & 3.0 & $-0.9$ & 0.5 \\
+    extreme  & 0.15 & 5.0 & $-0.99$ & 0.2 \\
+    ultra    & 0.25 & 8.0 & $-0.999$ & 0.1 \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -319,6 +387,43 @@ consistent IS on/off difference at any step size} (sign flips across cells) --- 
 \S\ref{sec:is}'s conclusion that step size, not the IS toggle, is the operative lever. This result
 is \textbf{not yet paired-confirmed with more seeds} and is reported here as a promising,
 preliminary lead.
+
+To check whether the step-size effect is specific to $k=2$ or a general lever, the identical
+sweep (same grid, same 3 seeds, \texttt{use\_importance\_sampling}=True) was run at $k=1$
+(Table~\ref{tab:stepsize-merged}). Nominal is shown for reference. \textbf{The step-size effect
+is not specific to $k=2$}: $k=1$ shows the same near-monotonic improvement as step size shrinks,
+reaching a similar or better optimum (BS in\_dist 7.41 at $0.00125$, beating $k=2$'s best of
+8.18; Heston in\_dist 7.63 at $0.005$, matching $k=2$'s best of 7.45 within sweep noise). This
+suggests smaller \texttt{ula\_step\_size} is beneficial regardless of $k$, and the earlier
+$k=2$-vs-$k=1$ comparison (\S\ref{sec:is}) at the shared default $0.02$ conflated two effects
+(chain length and step size) rather than isolating chain length alone.
+
+\begin{table}[h]
+  \centering
+  \caption{$k=1$ vs.\ $k=2$ step-size sweep, \texttt{use\_importance\_sampling}=True, means over
+  3 seeds (\texttt{nominal} for reference, no step size).}
+  \label{tab:stepsize-merged}
+  \small
+  \begin{tabular}{@{}llrrrr@{}}
+    \toprule
+    \texttt{ula\_step\_size} & $k$ & BS in\_dist & BS worst & Heston in\_dist & Heston worst \\
+    \midrule
+    -- & nominal & 9.88 & 497 & 9.53 & 67.3 \\
+    \addlinespace
+    0.02 (default) & 1 & 9.47 & 332 & 8.94 & 23.0 \\
+    0.01           & 1 & 8.96 & \textbf{265} & 7.85 & 18.4 \\
+    0.005          & 1 & 8.13 & 429 & 7.77 & \textbf{16.4} \\
+    0.0025         & 1 & 9.00 & 424 & 7.88 & 18.1 \\
+    0.00125        & 1 & \textbf{7.41} & 411 & 7.63 & 17.4 \\
+    \addlinespace
+    0.02 (default) & 2 & 9.41 & 352 & 9.65 & 23.3 \\
+    0.01           & 2 & 8.60 & 281 & 8.71 & 19.0 \\
+    0.005          & 2 & 8.51 & 449 & 7.63 & 17.8 \\
+    0.0025         & 2 & 8.51 & 654 & 7.90 & \textbf{16.4} \\
+    0.00125        & 2 & 8.18 & 386 & \textbf{7.45} & 18.0 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
 
 \subsection{Summary across investigations}
 
