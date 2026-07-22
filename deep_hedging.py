@@ -36,7 +36,7 @@ Array = jax.Array
 class MarketConfig:
     """Configure the simulated market; all fields are scalar model inputs."""
 
-    name: Literal["black_scholes", "heston"] = "black_scholes"
+    name: Literal["black_scholes", "heston", "lsv"] = "black_scholes"
     spot: float = 100.0
     strike: float = 100.0
     volatility: float = 0.2
@@ -48,6 +48,11 @@ class MarketConfig:
     n_time: int = 30
     horizon: float = 30.0 / 365.0
     dtype: Literal["float32", "float64"] = "float32"
+    # LSV (Heston + leverage) fields; unused unless name == "lsv".
+    leverage_beta: float = -0.3
+    leverage_kappa: float = 0.5
+    leverage_cap: float = 5.0
+    n_substeps: int = 10
 
 
 @chex.dataclass
@@ -268,12 +273,132 @@ def simulate_heston(key: Array, config: MarketConfig, batch: int) -> tuple[Array
     return tradables, features, variance
 
 
+def simulate_lsv(key: Array, config: MarketConfig, batch: int) -> tuple[Array, Array, Array]:
+    """Simulate Heston + leverage on a fine sub-grid; outputs tradables, features, variance at the coarse grid."""
+
+    dtype = jnp.float64 if config.dtype == "float64" else jnp.float32
+    n_fine = config.n_time * config.n_substeps
+    dt = jnp.asarray(config.horizon / n_fine, dtype=dtype)
+    chex.assert_shape(dt, ())
+    keys = jax.random.split(key, n_fine * 2).reshape(n_fine, 2, 2)
+    chex.assert_shape(keys, (n_fine, 2, 2))
+    kappa = jnp.asarray(config.kappa, dtype=dtype)
+    chex.assert_shape(kappa, ())
+    theta = jnp.asarray(config.long_variance, dtype=dtype)
+    chex.assert_shape(theta, ())
+    xi = jnp.asarray(config.vol_of_variance, dtype=dtype)
+    chex.assert_shape(xi, ())
+    rho = jnp.asarray(config.correlation, dtype=dtype)
+    chex.assert_shape(rho, ())
+    spot0 = jnp.asarray(config.spot, dtype=dtype)
+    chex.assert_shape(spot0, ())
+    beta = jnp.asarray(config.leverage_beta, dtype=dtype)
+    chex.assert_shape(beta, ())
+    kappa_l = jnp.asarray(config.leverage_kappa, dtype=dtype)
+    chex.assert_shape(kappa_l, ())
+    leverage_cap = jnp.asarray(config.leverage_cap, dtype=dtype)
+    chex.assert_shape(leverage_cap, ())
+    decay = jnp.exp(-kappa * dt)
+    chex.assert_shape(decay, ())
+    c = xi**2 * (1.0 - decay) / (4.0 * kappa)
+    chex.assert_shape(c, ())
+    dof = 4.0 * kappa * theta / xi**2
+    chex.assert_shape(dof, ())
+    fine_times = jnp.arange(n_fine, dtype=dtype) * dt
+    chex.assert_shape(fine_times, (n_fine,))
+
+    def step(carry: tuple[Array, Array, Array], values: tuple[Array, Array]):
+        """Advance one fine sub-interval; variance leg exact CIR, stock leg Euler with left-endpoint leverage."""
+
+        variance, log_stock, integrated = carry
+        step_keys, t_left = values
+        chex.assert_shape(variance, (batch,))
+        chex.assert_shape(t_left, ())
+        noncentrality = decay * variance / c
+        chex.assert_shape(noncentrality, (batch,))
+        poisson_key, gamma_key = jax.random.split(step_keys[0])
+        counts = jax.random.poisson(poisson_key, noncentrality / 2.0, shape=(batch,))
+        chex.assert_shape(counts, (batch,))
+        chi_square = 2.0 * jax.random.gamma(gamma_key, dof / 2.0 + counts, dtype=dtype)
+        chex.assert_shape(chi_square, (batch,))
+        next_variance = c * chi_square
+        chex.assert_shape(next_variance, (batch,))
+        # Piecewise-constant integrated variance over this fine sub-interval (left endpoint).
+        interval_variance = variance * dt
+        chex.assert_shape(interval_variance, (batch,))
+        z = jax.random.normal(step_keys[1], (batch,), dtype=dtype)
+        chex.assert_shape(z, (batch,))
+        # Exact identity rho * integral(sqrt(V) dW^V) over the sub-interval, independent of
+        # the stock leg's dynamics (a property of the CIR variance process alone), so it is
+        # reused unmodified from the plain-Heston scheme and only rescaled by leverage below.
+        correlated = (rho / xi) * (next_variance - variance - kappa * (theta * dt - interval_variance))
+        chex.assert_shape(correlated, (batch,))
+        raw_leverage = (jnp.exp(log_stock) / spot0) ** beta * (1.0 + kappa_l * t_left)
+        chex.assert_shape(raw_leverage, (batch,))
+        # Cap the leverage multiplier: uncapped, beta<0 blows up as S->0 in the left
+        # tail, feeding a runaway drift/diffusion spiral (verified empirically at
+        # n_time=100, n_substeps=10 with the default in-dist params). Capping the
+        # multiplier (not the spot ratio) is standard practice in local-vol/SLV
+        # simulation for boundary stability.
+        leverage = jnp.clip(raw_leverage, 0.0, leverage_cap)
+        chex.assert_shape(leverage, (batch,))
+        next_log_stock = (log_stock - 0.5 * leverage**2 * interval_variance
+                          + leverage * correlated
+                          + leverage * jnp.sqrt(1.0 - rho**2) * jnp.sqrt(jnp.maximum(interval_variance, 0.0)) * z)
+        chex.assert_shape(next_log_stock, (batch,))
+        next_integrated = integrated + interval_variance
+        chex.assert_shape(next_integrated, (batch,))
+        return (next_variance, next_log_stock, next_integrated), (next_variance, next_log_stock, next_integrated)
+
+    initial = (jnp.full((batch,), config.initial_variance, dtype=dtype),
+               jnp.full((batch,), jnp.log(config.spot), dtype=dtype),
+               jnp.zeros((batch,), dtype=dtype))
+    (_, _, _), (variance_fine, log_fine, integrated_fine) = jax.lax.scan(step, initial, (keys, fine_times))
+    chex.assert_shape(variance_fine, (n_fine, batch))
+    variance_fine = jnp.concatenate((initial[0][None], variance_fine), axis=0)
+    log_fine = jnp.concatenate((initial[1][None], log_fine), axis=0)
+    integrated_fine = jnp.concatenate((initial[2][None], integrated_fine), axis=0)
+    chex.assert_shape(variance_fine, (n_fine + 1, batch))
+    # Sub-sample fine states down to the coarse hedging grid; the strategy only trades here.
+    coarse_index = jnp.arange(config.n_time + 1) * config.n_substeps
+    chex.assert_shape(coarse_index, (config.n_time + 1,))
+    variance = variance_fine[coarse_index].T
+    chex.assert_shape(variance, (batch, config.n_time + 1))
+    logs = log_fine[coarse_index].T
+    chex.assert_shape(logs, (batch, config.n_time + 1))
+    integrated = integrated_fine[coarse_index].T
+    chex.assert_shape(integrated, (batch, config.n_time + 1))
+    times = jnp.linspace(0.0, config.horizon, config.n_time + 1, dtype=dtype)
+    chex.assert_shape(times, (config.n_time + 1,))
+    remaining = config.horizon - times[None, :]
+    chex.assert_shape(remaining, (1, config.n_time + 1))
+    # Conditional expectation of remaining integrated variance depends only on the variance
+    # marginal (unaffected by leverage), so this closed form is reused unmodified from Heston.
+    adjustment = ((variance - theta) / kappa) * (1.0 - jnp.exp(-kappa * remaining)) + theta * remaining
+    chex.assert_shape(adjustment, (batch, config.n_time + 1))
+    variance_swap = integrated + adjustment
+    chex.assert_shape(variance_swap, (batch, config.n_time + 1))
+    stock = jnp.exp(logs)
+    chex.assert_shape(stock, (batch, config.n_time + 1))
+    tradables = jnp.stack((stock, variance_swap), axis=-1)
+    chex.assert_shape(tradables, (batch, config.n_time + 1, 2))
+    features = jnp.stack((logs[:, :-1], variance[:, :-1]), axis=-1)
+    chex.assert_shape(features, (batch, config.n_time, 2))
+    if not isinstance(tradables, jax.core.Tracer):
+        chex.assert_tree_all_finite((tradables, variance))
+        chex.assert_trees_all_equal(jnp.all(variance >= 0.0), jnp.asarray(True))
+        chex.assert_trees_all_equal(jnp.all(stock > 0.0), jnp.asarray(True))
+    return tradables, features, variance
+
+
 def simulate_market(key: Array, config: MarketConfig, batch: int) -> tuple[Array, Array, Array | None]:
     """Dispatch market simulation; inputs are key/config/batch and outputs are tradables/features/variance."""
 
     if config.name == "black_scholes":
         prices, features = simulate_black_scholes(key, config, batch)
         return prices, features, None
+    if config.name == "lsv":
+        return simulate_lsv(key, config, batch)
     return simulate_heston(key, config, batch)
 
 
@@ -635,7 +760,7 @@ def make_steps(optimizer: optax.GradientTransformation, strategy_config: Strateg
         strategy = eqx.apply_updates(strategy, updates)
         strategy = eqx.tree_at(lambda s: (s.mean1, s.var1, s.mean2, s.var2), strategy,
                                (bn_strategy.mean1, bn_strategy.var1, bn_strategy.mean2, bn_strategy.var2))
-        grad_norm = optax.tree.norm(grads)
+        grad_norm = optax.global_norm(grads)
         chex.assert_shape(loss, ())
         chex.assert_shape(grad_norm, ())
         return strategy, opt_state, loss, grad_norm
@@ -703,7 +828,7 @@ def make_robust_steps(
         strategy = eqx.tree_at(
             lambda candidate: (candidate.mean1, candidate.var1, candidate.mean2, candidate.var2),
             strategy, (bn_strategy.mean1, bn_strategy.var1, bn_strategy.mean2, bn_strategy.var2))
-        grad_norm = optax.tree.norm(grads)
+        grad_norm = optax.global_norm(grads)
         chex.assert_shape(loss, ())
         chex.assert_shape(grad_norm, ())
         return strategy, robust_state, opt_state, loss, grad_norm
@@ -726,8 +851,19 @@ def make_robust_steps(
     return train_step, evaluate
 
 
-def train(config: Config) -> tuple[Strategy, RobustState | None, dict[str, list[float]]]:
-    """Train nominal or WDRO hedging with fixed validation; input config, outputs best model/dual/history."""
+def train(
+    config: Config,
+    train_dataset: tuple[Array, Array, Array | None] | None = None,
+    validation_dataset: tuple[Array, Array, Array | None] | None = None,
+) -> tuple[Strategy, RobustState | None, dict[str, list[float]]]:
+    """Train nominal or WDRO hedging with fixed validation; input config, outputs best model/dual/history.
+
+    If `train_dataset`/`validation_dataset` are given (each a `(prices, features, variance)`
+    triple, `variance` possibly `None`), training samples minibatches with replacement from the
+    fixed `train_dataset` pool instead of simulating fresh iid paths every step, and validation
+    uses `validation_dataset` as-is. This is what a finite training-sample-size `n` study needs;
+    passing neither reproduces the original iid-per-step behavior exactly.
+    """
 
     if config.robust.enabled:
         if config.robust.rho < 0.0 or config.robust.kl_epsilon <= 0.0 or config.robust.tau < 0.0:
@@ -744,19 +880,33 @@ def train(config: Config) -> tuple[Strategy, RobustState | None, dict[str, list[
         simulation_key, config.market, config.training.batch_size))
     simulate_validation = jax.jit(lambda simulation_key: simulate_market(
         simulation_key, config.market, config.training.validation_size))
-    validation_prices, validation_features, validation_variance = simulate_validation(validation_key)
+    if validation_dataset is not None:
+        validation_prices, validation_features, validation_variance = validation_dataset
+    else:
+        validation_prices, validation_features, validation_variance = simulate_validation(validation_key)
+    train_prices = train_features = train_variance = None
+    n_pool = 0
+    if train_dataset is not None:
+        train_prices, train_features, train_variance = train_dataset
+        n_pool = train_prices.shape[0]
     raw_lambda = jnp.log(jnp.expm1(jnp.asarray(config.robust.initial_lambda, dtype=strategy.cash.dtype)))
     chex.assert_shape(raw_lambda, ())
     eta = jnp.asarray(config.robust.initial_eta, dtype=strategy.cash.dtype)
     chex.assert_shape(eta, ())
     if config.robust.enabled:
-        standardization_prices, _, standardization_variance = simulate_validation(
-            standardization_key)
+        if train_dataset is not None:
+            # Standardize from the training pool itself (not validation) to avoid leaking
+            # held-out-fold statistics into the anchor location/scale.
+            standardization_prices, standardization_variance = train_prices, train_variance
+        else:
+            standardization_prices, _, standardization_variance = simulate_validation(
+                standardization_key)
         standardization_coordinates = encode_trajectory(
             standardization_prices, standardization_variance, config.market)
+        n_standardization = standardization_coordinates.shape[0]
         dimension = standardization_coordinates.shape[1]
         chex.assert_shape(
-            standardization_coordinates, (config.training.validation_size, dimension))
+            standardization_coordinates, (n_standardization, dimension))
         coordinate_location = jnp.mean(standardization_coordinates, axis=0)
         chex.assert_shape(coordinate_location, (dimension,))
         coordinate_scale = jnp.maximum(jnp.std(standardization_coordinates, axis=0), 1e-3)
@@ -789,7 +939,13 @@ def train(config: Config) -> tuple[Strategy, RobustState | None, dict[str, list[
         "lambda": [], "eta": []}
     for step in range(config.training.steps):
         key, batch_key, proposal_key = jax.random.split(key, 3)
-        prices, features, variance = simulate_training(batch_key)
+        if train_dataset is not None:
+            indices = jax.random.randint(batch_key, (config.training.batch_size,), 0, n_pool)
+            prices = train_prices[indices]
+            features = train_features[indices]
+            variance = None if train_variance is None else train_variance[indices]
+        else:
+            prices, features, variance = simulate_training(batch_key)
         if robust_state is None:
             strategy, opt_state, loss, grad_norm = train_step(
                 strategy, opt_state, prices, features)
