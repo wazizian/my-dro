@@ -19,6 +19,7 @@ import tyro
 from wdro import (
     RobustConfig,
     RobustState,
+    convex_order_penalty,
     entropic_dual,
     joint_cvar_dual,
     per_sample_cvar_dual,
@@ -40,9 +41,9 @@ class MarketConfig:
     spot: float = 100.0
     strike: float = 100.0
     volatility: float = 0.2
-    kappa: float = 1.0
+    kappa: float = 3.0
     long_variance: float = 0.04
-    vol_of_variance: float = 2.0
+    vol_of_variance: float = 0.4
     correlation: float = -0.7
     initial_variance: float = 0.04
     n_time: int = 30
@@ -678,6 +679,14 @@ def robust_hedging_loss(
             strategy, proposed_prices, proposed_features, epsilon, strategy_config, False,
             market.strike)
         chex.assert_shape(proposed_loss, (1,))
+        if robust_config.enforce_convex_order:
+            order_lambda_ij = jax.nn.softplus(robust_state.raw_lambda_ij)
+            order_penalty = convex_order_penalty(
+                proposed_prices[..., 0], jnp.asarray(robust_config.convex_order_strikes,
+                                                      dtype=proposed_prices.dtype), order_lambda_ij)
+            chex.assert_shape(order_penalty, (1,))
+            proposed_loss = proposed_loss + order_penalty
+            chex.assert_shape(proposed_loss, (1,))
         difference = (sample - anchor) / reference_scale
         chex.assert_shape(difference, (dimension,))
         squared_distance = jnp.sum(jnp.square(difference))
@@ -714,6 +723,14 @@ def robust_hedging_loss(
     chex.assert_shape(flat_losses, (batch * n_proposals,))
     pathwise_losses = flat_losses.reshape(batch, n_proposals)
     chex.assert_shape(pathwise_losses, (batch, n_proposals))
+    if robust_config.enforce_convex_order:
+        order_lambda_ij = jax.nn.softplus(robust_state.raw_lambda_ij)
+        flat_order_penalty = convex_order_penalty(
+            proposed_prices[..., 0], jnp.asarray(robust_config.convex_order_strikes,
+                                                  dtype=proposed_prices.dtype), order_lambda_ij)
+        chex.assert_shape(flat_order_penalty, (batch * n_proposals,))
+        pathwise_losses = pathwise_losses + flat_order_penalty.reshape(batch, n_proposals)
+        chex.assert_shape(pathwise_losses, (batch, n_proposals))
     transport_cost = quadratic_transport_cost(
         proposals, anchors, reference_scale, robust_config.cost_power)
     chex.assert_shape(transport_cost, (batch, n_proposals))
@@ -819,6 +836,10 @@ def make_robust_steps(
             robust_grads = eqx.tree_at(
                 lambda candidate: candidate.raw_lambda, robust_grads,
                 jnp.zeros_like(robust_grads.raw_lambda))
+        if not robust_config.enforce_convex_order or robust_config.fix_convex_order_lambda:
+            robust_grads = eqx.tree_at(
+                lambda candidate: candidate.raw_lambda_ij, robust_grads,
+                jnp.zeros_like(robust_grads.raw_lambda_ij))
         robust_grads = eqx.tree_at(
             lambda candidate: (candidate.location, candidate.scale), robust_grads,
             (jnp.zeros_like(robust_grads.location), jnp.zeros_like(robust_grads.scale)))
@@ -911,7 +932,13 @@ def train(
         chex.assert_shape(coordinate_location, (dimension,))
         coordinate_scale = jnp.maximum(jnp.std(standardization_coordinates, axis=0), 1e-3)
         chex.assert_shape(coordinate_scale, (dimension,))
-        robust_state = RobustState(raw_lambda, eta, coordinate_location, coordinate_scale)
+        n_strikes = len(config.robust.convex_order_strikes)
+        raw_lambda_ij_init = jnp.log(jnp.expm1(jnp.asarray(
+            config.robust.convex_order_lambda_init, dtype=strategy.cash.dtype)))
+        raw_lambda_ij = jnp.full((n_strikes, config.market.n_time), raw_lambda_ij_init,
+                                 dtype=strategy.cash.dtype)
+        chex.assert_shape(raw_lambda_ij, (n_strikes, config.market.n_time))
+        robust_state = RobustState(raw_lambda, eta, coordinate_location, coordinate_scale, raw_lambda_ij)
     else:
         robust_state = None
     parameters = (strategy, robust_state) if robust_state is not None else strategy

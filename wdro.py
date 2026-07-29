@@ -41,6 +41,10 @@ class RobustConfig:
     exact_eta: bool = False
     ula_temper: bool = False
     anchor_mix_prob: float = 0.0
+    enforce_convex_order: bool = False
+    convex_order_strikes: tuple[float, ...] = (90.0, 100.0, 110.0)
+    convex_order_lambda_init: float = 1.0
+    fix_convex_order_lambda: bool = False
 
 
 class RobustState(eqx.Module):
@@ -50,6 +54,7 @@ class RobustState(eqx.Module):
     eta: Array
     location: Array
     scale: Array
+    raw_lambda_ij: Array = eqx.field(default_factory=lambda: jnp.zeros((1, 1)))
 
 
 def gaussian_log_density(value: Array, mean: Array, variance: Array) -> Array:
@@ -226,6 +231,30 @@ def sample_langevin_proposal(
     return samples, log_weights
 
 
+def convex_order_penalty(stock_prices: Array, strikes: Array, lambda_ij: Array) -> Array:
+    """Compute the relaxed convex-order (peacock) penalty on a stock-leg path; inputs are
+    (n, n_time+1) prices, (n_strikes,) strikes, (n_strikes, n_time) nonnegative multipliers,
+    output is (n,) per-path penalties.
+
+    Penalizes sum_j sum_i lambda_ij * [(X_tj - k_i)_+ - (X_t(j+1) - k_i)_+]; positive when a
+    path's call-price-across-time violates convex order (call price should be nondecreasing in
+    maturity for a true martingale), zero or negative otherwise. lambda_ij must already be
+    nonnegative (e.g. softplus-transformed by the caller).
+    """
+
+    n, n_points = stock_prices.shape
+    n_time = n_points - 1
+    n_strikes = strikes.shape[0]
+    chex.assert_shape(lambda_ij, (n_strikes, n_time))
+    calls = jax.nn.relu(stock_prices[:, :, None] - strikes[None, None, :])
+    chex.assert_shape(calls, (n, n_points, n_strikes))
+    diff = calls[:, :-1, :] - calls[:, 1:, :]
+    chex.assert_shape(diff, (n, n_time, n_strikes))
+    penalty = jnp.sum(diff * lambda_ij.T[None, :, :], axis=(1, 2))
+    chex.assert_shape(penalty, (n,))
+    return penalty
+
+
 def entropic_dual(
     state: RobustState,
     pathwise_loss: Array,
@@ -268,7 +297,10 @@ def plain_average_dual(
     n_proposals forward passes) but with none of the WDRO dual machinery, isolating whether an
     apparent robustness edge is just an effect of more (perturbed) samples per training step.
     transport_cost/state.raw_lambda are accepted only to match the other duals' call signature
-    and are intentionally unused.
+    and are intentionally unused. Note: pathwise_loss itself may already include the relaxed
+    convex-order penalty (see convex_order_penalty), which is folded in upstream of every dual
+    dispatch when RobustConfig.enforce_convex_order is set -- that mechanism is independent of
+    this dual's own "no transport-cost penalty" property.
     """
 
     del transport_cost, state
@@ -298,7 +330,10 @@ def plain_cvar_of_average_dual(
     inner tilt as the only remaining difference from relaxed_kl_cvar_dual. transport_cost and
     state.raw_lambda are accepted only for call-signature compatibility and are unused. Unlike
     joint_cvar_dual/relaxed_kl_cvar_dual, only the standard tail_power=1.0 (true CVaR, L^1 norm
-    of the positive part) shape is implemented -- config.tail_power is not read.
+    of the positive part) shape is implemented -- config.tail_power is not read. Note:
+    pathwise_loss itself may already include the relaxed convex-order penalty (see
+    convex_order_penalty), folded in upstream of every dual dispatch when
+    RobustConfig.enforce_convex_order is set -- independent of this dual's own properties.
     """
 
     del transport_cost

@@ -36,17 +36,21 @@ STEPS = 2000
 BATCH_SIZE = 64
 CANONICAL_ALPHA = 0.95
 
-# In-distribution / shifted leverage params, per lsv.md S1/S4.
+# In-distribution / 3-tier leverage-shift severity ladder, per lsv.md S1/S4. weak/medium/hard are
+# 1.5x/2x/3x multiples of the in_dist (leverage_beta, leverage_kappa) offset from zero.
 LEVERAGE_PARAMS = {
     "in_dist": {"leverage_beta": -0.3, "leverage_kappa": 0.5},
-    "shifted": {"leverage_beta": -0.45, "leverage_kappa": 0.75},
+    "weak": {"leverage_beta": -0.45, "leverage_kappa": 0.75},
+    "medium": {"leverage_beta": -0.6, "leverage_kappa": 1.0},
+    "hard": {"leverage_beta": -0.9, "leverage_kappa": 1.5},
 }
+SHIFT_TIERS = ("weak", "medium", "hard")
 
 # tag -> fixed integer offset for deterministic, cache-stable PRNG derivation.
-_TAG_OFFSETS = {"train_pool": 0, "test_indist": 1, "test_shifted": 2}
+_TAG_OFFSETS = {"train_pool": 0, "test_indist": 1, "test_weak": 2, "test_medium": 3, "test_hard": 4}
 
 
-def lsv_market(variant: Literal["in_dist", "shifted"]) -> MarketConfig:
+def lsv_market(variant: Literal["in_dist", "weak", "medium", "hard"]) -> MarketConfig:
     """Build the LSV MarketConfig for a leverage variant; input variant name, output MarketConfig."""
 
     return MarketConfig(name="lsv", n_time=100, horizon=100.0 / 365.0, dtype="float32",
@@ -192,10 +196,11 @@ def run_one(method: str, n: int, seed: int, cache_dir: Path, k: int = K_FOLDS, s
         raise ValueError("retrain=False requires k=1 (single train/val split); ambiguous with k>1 folds")
 
     market_indist = lsv_market("in_dist")
-    market_shifted = lsv_market("shifted")
+    shift_markets = {tier: lsv_market(tier) for tier in SHIFT_TIERS}
     train_pool = load_or_simulate(cache_dir, seed, "train_pool", market_indist, n_max)
     test_indist = load_or_simulate(cache_dir, seed, "test_indist", market_indist, n_test)
-    test_shifted = load_or_simulate(cache_dir, seed, "test_shifted", market_shifted, n_test)
+    shift_test_sets = {tier: load_or_simulate(cache_dir, seed, f"test_{tier}", shift_markets[tier], n_test)
+                       for tier in SHIFT_TIERS}
 
     grid = grid_for(method)
     scored = [(hp, *kfold_score(method, hp, n, seed, train_pool, market_indist, k, steps)) for hp in grid]
@@ -214,13 +219,16 @@ def run_one(method: str, n: int, seed: int, cache_dir: Path, k: int = K_FOLDS, s
         strategy, config = best_strategies[0], best_config
 
     row = {"method": method, "n": n, "seed": seed, "kfold_val_cvar95": best_score,
-          "test_cvar95_indist": evaluate_cvar95(strategy, config.strategy, market_indist, config.epsilon, test_indist),
-          "test_cvar95_shifted": evaluate_cvar95(strategy, config.strategy, market_shifted, config.epsilon, test_shifted)}
+          "test_cvar95_indist": evaluate_cvar95(strategy, config.strategy, market_indist, config.epsilon, test_indist)}
+    for tier in SHIFT_TIERS:
+        row[f"test_cvar95_{tier}"] = evaluate_cvar95(
+            strategy, config.strategy, shift_markets[tier], config.epsilon, shift_test_sets[tier])
     row.update({f"hp_{key}": value for key, value in best_hp.items()})
     return row
 
 
-CSV_FIELDNAMES = ["method", "n", "seed", "kfold_val_cvar95", "test_cvar95_indist", "test_cvar95_shifted",
+CSV_FIELDNAMES = ["method", "n", "seed", "kfold_val_cvar95", "test_cvar95_indist",
+                  "test_cvar95_weak", "test_cvar95_medium", "test_cvar95_hard",
                   "hp_learning_rate", "hp_alpha", "hp_proposal_scale", "hp_rho"]
 
 

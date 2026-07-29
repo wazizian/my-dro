@@ -22,9 +22,19 @@ stays valid as a regression check.
 `L(t, S) = (S / S0)^beta * (1 + kappa_L * t)`.
 
 - In-distribution / training params: `beta = -0.3`, `kappa_L = 0.5`.
-- Shifted-test params (§4): `beta = -0.45`, `kappa_L = 0.75` — both magnitudes scaled
-  ×1.5 (steeper negative skew, faster time-growth), same functional form. A fixed,
-  single offset, not a grid.
+- Shifted-test params (§4): a 3-tier severity ladder, each tier scaling both `beta` and
+  `kappa_L` magnitudes by a fixed multiple of the in-dist values (steeper negative skew,
+  faster time-growth), same functional form throughout — fixed offsets, not a grid:
+  - `weak`: ×1.5 → `beta = -0.45`, `kappa_L = 0.75`
+  - `medium`: ×2 → `beta = -0.6`, `kappa_L = 1.0`
+  - `hard`: ×3 → `beta = -0.9`, `kappa_L = 1.5`
+
+**Heston core params** (risk-neutral-calibrated, not physical/historical): `kappa = 3.0`,
+`long_variance = 0.04`, `vol_of_variance = 0.4`, `correlation = -0.7`,
+`initial_variance = 0.04` — grounded against literature-typical risk-neutral SPX Heston
+calibrations (`rho ~ -0.7`, vol-of-vol `~0.3-0.45`, `kappa ~ 1.5-3`) and Feller-condition
+satisfying (`2*kappa*theta = 0.24 > vol_of_variance^2 = 0.16`), unlike the prior defaults
+(`kappa=1.0, vol_of_variance=2.0`, which badly violated Feller).
 
 **Discretization.** No closed form exists once `L` depends on `S`, so the stock leg is
 Euler (`L` evaluated at the left endpoint of each fine substep); the variance leg keeps
@@ -88,25 +98,26 @@ For each `n`:
   explored in the Heston/BS report. `cvar_of_average`/`relaxed_kl_wdro` use 2
   values/axis (endpoints only) rather than 3 — compute-budget trim, see §7.
 - **Fixed, not tuned**: batch size (`64` for all 3 methods) and iteration count
-  (`TrainingConfig.steps` fixed across all `n`/methods/hyperparams — no early
-  stopping, no budget scaling).
+  (`TrainingConfig.steps = 2000`, fixed across all `n`/methods/hyperparams — no
+  early stopping, no budget scaling; picked as a compute-tractable value well
+  below the codebase's `20_000` default, given ~1,200 total training runs).
 - After picking the best hyperparams from k-fold, **refit once on the full `n`
   training paths** (all folds pooled) with those hyperparams. This refit is what gets
   evaluated at test time.
 
 ## 4. Test-time evaluation
 
-Two test metrics per (method, n, seed, hyperparam-selected-model):
+Four test metrics per (method, n, seed, hyperparam-selected-model):
 
 1. **In-distribution test CVaR-95**: evaluate the refit model on a *fixed, large* test
    set of LSV paths, `n_test = 20_000` (well above `n_max = 1000`, in\_dist leverage
    params `beta=-0.3, kappa_L=0.5`). Large enough that test CVaR itself isn't the noisy
    bottleneck (20k paths → ~1000 in the CVaR-95 tail).
-2. **Shifted test CVaR-95**: same model, evaluated on a second fixed test set of equal
-   size (`n_test = 20_000`), drawn from the same market with the shifted leverage
-   params from §1 (`beta=-0.45, kappa_L=0.75`) — a single fixed offset, not a grid.
+2. **Shifted test CVaR-95, 3 severity tiers**: same model, evaluated on three further
+   fixed test sets of equal size (`n_test = 20_000` each), drawn from the same market
+   with the `weak`/`medium`/`hard` leverage params from §1 — fixed offsets, not a grid.
 
-Both test sets are shared across every method/hyperparam/n combination (see §5) so
+All four test sets are shared across every method/hyperparam/n combination (see §5) so
 comparisons are paired, not just averaged.
 
 ## 5. Dataset generation (once, upfront)
@@ -156,3 +167,25 @@ Total: `78 × 5 n-values × 3 seeds ≈ 1,200` training runs — down from the o
 further reduced the count on top of the two compute mitigations). Simulation cost
 (`n_substeps=10`-fine LSV) is paid once via the §5 cache, not per training run, and is
 unaffected by these mitigations.
+
+**Empirical correction to this estimate (post-implementation)**: the above assumed all
+training runs cost roughly the same. Measured at `steps=2000, n_time=100, n_substeps=10`:
+`cvar` (nominal, no proposal sampling) ≈ 16s/run, but `cvar_of_average`/`relaxed_kl_wdro`
+(32 proposal samples/step) ≈ 211s/run — about 13× slower. At the `k=3`-fold design above,
+this puts the real wall-clock at ≈46 hours of continuous single-process compute (dominated
+by the two robust methods' `k=3` fold-trainings), not accounted for when the run-count
+mitigations above were designed. Applied one further mitigation to make the actual sweep
+run tractable:
+
+4. **`k = 1` instead of 3, and no separate full-`n` refit.** `k=1` is a single deterministic
+   80/20 train/val split (not a fold rotation) — one training per hyperparameter combo
+   instead of three. The winning combo's already-trained model (on the 80% split) is used
+   directly for test evaluation, skipping the separate "refit on pooled full-`n`" step
+   entirely. New per-`(n,seed)` count: `9 + 8 + 8 = 25` trainings (no `+3` refits). Real
+   measured total: ≈`14.6` hours across `5 n-values × 3 seeds`.
+   **Tradeoff**: hyperparameter selection is now based on one train/val split's CVaR-95
+   rather than a 3-fold mean, and the final reported model per `(n, seed, method)` was
+   trained on 80% of `n` (not the full `n`) — both add variance to the results relative to
+   the originally-specified `k=3`-plus-refit design, in exchange for the ≈3× wall-clock cut.
+   `lsv_sweep.py` still supports `k≥2`/`--retrain` for a closer-to-spec run if that variance
+   turns out to matter.
