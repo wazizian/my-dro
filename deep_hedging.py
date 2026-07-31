@@ -63,6 +63,7 @@ class StrategyConfig:
     bn_momentum: float = 0.99
     bn_epsilon: float = 1e-5
     stock_only: bool = False
+    latent_dim: int = 0
 
 
 @chex.dataclass
@@ -75,6 +76,7 @@ class TrainingConfig:
     validation_size: int = 65_536
     validation_frequency: int = 250
     seed: int = 0
+    grad_clip_norm: float | None = None
 
 
 @chex.dataclass
@@ -100,7 +102,7 @@ class Config:
     alpha: float = 0.95
 
 
-class Strategy(eqx.Module):
+class MLPCore(eqx.Module):
     """Hold all time-specific MLP and batch-normalization parameters as leading-time arrays."""
 
     w1: Array
@@ -117,6 +119,33 @@ class Strategy(eqx.Module):
     var1: Array
     mean2: Array
     var2: Array
+
+
+class GRUCore(eqx.Module):
+    """Hold time-specific GRU-cell + LayerNorm + output-head parameters as leading-time arrays."""
+
+    w_ir: Array
+    w_iz: Array
+    w_in: Array
+    w_hr: Array
+    w_hz: Array
+    w_hn: Array
+    b_ir: Array
+    b_iz: Array
+    b_in: Array
+    b_hr: Array
+    b_hz: Array
+    b_hn: Array
+    ln_gamma: Array
+    ln_beta: Array
+    w_out: Array
+    b_out: Array
+
+
+class Strategy(eqx.Module):
+    """Hold the recurrent policy core (MLP+BN or GRU+LayerNorm) plus the scalar training extras."""
+
+    core: MLPCore | GRUCore
     cash: Array
     q: Array
 
@@ -127,14 +156,11 @@ def market_dimensions(config: MarketConfig) -> tuple[int, int]:
     return (1, 1) if config.name == "black_scholes" else (2, 2)
 
 
-def initialize_strategy(key: Array, market: MarketConfig) -> Strategy:
-    """Initialize paper-width, time-specific MLPs; inputs are a PRNG key/config and output is Strategy."""
+def _initialize_mlp_core(key: Array, n_assets: int, n_features: int, n_time: int, dtype) -> MLPCore:
+    """Initialize paper-width, time-specific BN+MLPs; inputs are key/dims, output is an MLPCore."""
 
-    n_assets, n_features = market_dimensions(market)
-    n_time = market.n_time
     n_input = n_features + n_assets
     hidden = n_assets + 15
-    dtype = jnp.float64 if market.dtype == "float64" else jnp.float32
     keys = jax.random.split(key, 6 * n_time).reshape(6, n_time, 2)
     chex.assert_shape(keys, (6, n_time, 2))
     scale1 = jnp.asarray(1.0 / np.sqrt(float(n_input)), dtype=dtype)
@@ -157,12 +183,69 @@ def initialize_strategy(key: Array, market: MarketConfig) -> Strategy:
     chex.assert_shape(zeros1, (n_time, hidden))
     ones1 = jnp.ones((n_time, hidden), dtype=w1.dtype)
     chex.assert_shape(ones1, (n_time, hidden))
-    cash = jnp.asarray(0.0, dtype=w1.dtype)
+    return MLPCore(w1, b1, w2, b2, w3, b3, ones1, zeros1, ones1, zeros1, zeros1, ones1, zeros1, ones1)
+
+
+def _initialize_gru_core(key: Array, n_assets: int, n_features: int, n_time: int, latent_dim: int, dtype) -> GRUCore:
+    """Initialize a per-timestep GRU cell + LayerNorm + output head; inputs key/dims, output a GRUCore."""
+
+    hidden = n_assets + latent_dim
+    keys = jax.random.split(key, 8 * n_time).reshape(8, n_time, 2)
+    chex.assert_shape(keys, (8, n_time, 2))
+    scale_in = jnp.asarray(1.0 / np.sqrt(float(n_features)), dtype=dtype)
+    chex.assert_shape(scale_in, ())
+    scale_hidden = jnp.asarray(1.0 / np.sqrt(float(hidden)), dtype=dtype)
+    chex.assert_shape(scale_hidden, ())
+
+    def input_weight(date_key):
+        return jax.random.uniform(date_key, (hidden, n_features), minval=-scale_in, maxval=scale_in, dtype=dtype)
+
+    def hidden_weight(date_key):
+        return jax.random.uniform(date_key, (hidden, hidden), minval=-scale_hidden, maxval=scale_hidden, dtype=dtype)
+
+    def hidden_bias(date_key):
+        return jax.random.uniform(date_key, (hidden,), minval=-scale_hidden, maxval=scale_hidden, dtype=dtype)
+
+    w_ir = jax.vmap(input_weight)(keys[0])
+    chex.assert_shape(w_ir, (n_time, hidden, n_features))
+    w_iz = jax.vmap(input_weight)(keys[1])
+    w_in = jax.vmap(input_weight)(keys[2])
+    w_hr = jax.vmap(hidden_weight)(keys[3])
+    chex.assert_shape(w_hr, (n_time, hidden, hidden))
+    w_hz = jax.vmap(hidden_weight)(keys[4])
+    w_hn = jax.vmap(hidden_weight)(keys[5])
+    b_ir = jax.vmap(hidden_bias)(keys[6])
+    chex.assert_shape(b_ir, (n_time, hidden))
+    b_iz = jnp.zeros((n_time, hidden), dtype=dtype)
+    b_in = jnp.zeros((n_time, hidden), dtype=dtype)
+    b_hr = jnp.zeros((n_time, hidden), dtype=dtype)
+    b_hz = jnp.zeros((n_time, hidden), dtype=dtype)
+    b_hn = jnp.zeros((n_time, hidden), dtype=dtype)
+    ln_gamma = jnp.ones((n_time, hidden), dtype=dtype)
+    ln_beta = jnp.zeros((n_time, hidden), dtype=dtype)
+    w_out = jax.vmap(lambda date_key: jax.random.uniform(
+        date_key, (n_assets, hidden), minval=-scale_hidden, maxval=scale_hidden, dtype=dtype))(keys[7])
+    chex.assert_shape(w_out, (n_time, n_assets, hidden))
+    b_out = jnp.zeros((n_time, n_assets), dtype=dtype)
+    return GRUCore(w_ir, w_iz, w_in, w_hr, w_hz, w_hn, b_ir, b_iz, b_in, b_hr, b_hz, b_hn,
+                   ln_gamma, ln_beta, w_out, b_out)
+
+
+def initialize_strategy(key: Array, market: MarketConfig, strategy_config: StrategyConfig) -> Strategy:
+    """Initialize the recurrent policy; inputs are a PRNG key/market/strategy config, output is Strategy."""
+
+    n_assets, n_features = market_dimensions(market)
+    n_time = market.n_time
+    dtype = jnp.float64 if market.dtype == "float64" else jnp.float32
+    if strategy_config.latent_dim > 0:
+        core = _initialize_gru_core(key, n_assets, n_features, n_time, strategy_config.latent_dim, dtype)
+    else:
+        core = _initialize_mlp_core(key, n_assets, n_features, n_time, dtype)
+    cash = jnp.asarray(0.0, dtype=dtype)
     chex.assert_shape(cash, ())
-    q = jnp.asarray(0.0, dtype=w1.dtype)
+    q = jnp.asarray(0.0, dtype=dtype)
     chex.assert_shape(q, ())
-    return Strategy(w1, b1, w2, b2, w3, b3, ones1, zeros1, ones1, zeros1,
-                    zeros1, ones1, zeros1, ones1, cash, q)
+    return Strategy(core=core, cash=cash, q=q)
 
 
 def simulate_black_scholes(key: Array, config: MarketConfig, batch: int) -> tuple[Array, Array]:
@@ -486,17 +569,16 @@ def decode_trajectory(coordinates: Array, config: MarketConfig) -> tuple[Array, 
     return prices, features, variance
 
 
-def strategy_apply(strategy: Strategy, features: Array, config: StrategyConfig, training: bool) -> tuple[Array, Strategy]:
-    """Scan the semi-recurrent policy; inputs are parameters/features/mode, outputs holdings/new BN state."""
+def _mlp_apply(core: MLPCore, features: Array, config: StrategyConfig, training: bool) -> tuple[Array, MLPCore]:
+    """Scan the semi-recurrent BN+MLP policy; inputs are core/features/mode, outputs holdings/new BN state."""
 
     batch, n_time, n_features = features.shape
-    n_assets = strategy.b3.shape[-1]
-    chex.assert_shape(features, (batch, n_time, n_features))
+    n_assets = core.b3.shape[-1]
     features_t = jnp.swapaxes(features, 0, 1)
     chex.assert_shape(features_t, (n_time, batch, n_features))
-    xs = (features_t, strategy.w1, strategy.b1, strategy.w2, strategy.b2,
-          strategy.w3, strategy.b3, strategy.gamma1, strategy.beta1, strategy.gamma2,
-          strategy.beta2, strategy.mean1, strategy.var1, strategy.mean2, strategy.var2)
+    xs = (features_t, core.w1, core.b1, core.w2, core.b2,
+          core.w3, core.b3, core.gamma1, core.beta1, core.gamma2,
+          core.beta2, core.mean1, core.var1, core.mean2, core.var2)
 
     def step(previous: Array, values: tuple[Array, ...]):
         """Apply one date-specific network; inputs previous holdings/arrays, outputs holding/BN statistics."""
@@ -554,9 +636,72 @@ def strategy_apply(strategy: Strategy, features: Array, config: StrategyConfig, 
     chex.assert_shape(holdings_t, (n_time, batch, n_assets))
     holdings = jnp.swapaxes(holdings_t, 0, 1)
     chex.assert_shape(holdings, (batch, n_time, n_assets))
-    new_strategy = eqx.tree_at(lambda s: (s.mean1, s.var1, s.mean2, s.var2), strategy,
-                               (mean1, var1, mean2, var2))
-    return holdings, new_strategy
+    new_core = eqx.tree_at(lambda c: (c.mean1, c.var1, c.mean2, c.var2), core,
+                           (mean1, var1, mean2, var2))
+    return holdings, new_core
+
+
+def _gru_apply(core: GRUCore, features: Array, config: StrategyConfig) -> Array:
+    """Scan a per-timestep GRU cell + LayerNorm policy; inputs are core/features, output is holdings.
+
+    LayerNorm normalizes the hidden state per-sample every step (no batch statistics, no
+    train/eval distinction) and the sigmoid-bounded reset/update gates control how much of the
+    latent state carries forward -- together these are the standard fix for the vanishing/
+    exploding-gradient blowup that BPTT through a long BN+MLP scan hits at large n_time.
+    """
+
+    batch, n_time, n_features = features.shape
+    hidden = core.w_hr.shape[-1]
+    n_assets = core.b_out.shape[-1]
+    features_t = jnp.swapaxes(features, 0, 1)
+    chex.assert_shape(features_t, (n_time, batch, n_features))
+    xs = (features_t, core.w_ir, core.w_iz, core.w_in, core.w_hr, core.w_hz, core.w_hn,
+          core.b_ir, core.b_iz, core.b_in, core.b_hr, core.b_hz, core.b_hn,
+          core.ln_gamma, core.ln_beta, core.w_out, core.b_out)
+
+    def step(hidden_state: Array, values: tuple[Array, ...]):
+        """Apply one date-specific GRU cell; inputs previous hidden/arrays, outputs holding."""
+
+        (feature, w_ir, w_iz, w_in, w_hr, w_hz, w_hn, b_ir, b_iz, b_in, b_hr, b_hz, b_hn,
+         ln_gamma, ln_beta, w_out, b_out) = values
+        chex.assert_shape(feature, (batch, n_features))
+        reset = jax.nn.sigmoid(feature @ w_ir.T + b_ir + hidden_state @ w_hr.T + b_hr)
+        chex.assert_shape(reset, (batch, hidden))
+        update = jax.nn.sigmoid(feature @ w_iz.T + b_iz + hidden_state @ w_hz.T + b_hz)
+        chex.assert_shape(update, (batch, hidden))
+        candidate = jnp.tanh(feature @ w_in.T + b_in + reset * (hidden_state @ w_hn.T + b_hn))
+        chex.assert_shape(candidate, (batch, hidden))
+        raw_next = (1.0 - update) * candidate + update * hidden_state
+        chex.assert_shape(raw_next, (batch, hidden))
+        mean = jnp.mean(raw_next, axis=-1, keepdims=True)
+        variance = jnp.var(raw_next, axis=-1, keepdims=True)
+        normalized = (raw_next - mean) / jnp.sqrt(variance + config.bn_epsilon)
+        next_hidden = ln_gamma * normalized + ln_beta
+        chex.assert_shape(next_hidden, (batch, hidden))
+        holding = next_hidden @ w_out.T + b_out
+        chex.assert_shape(holding, (batch, n_assets))
+        if config.stock_only and n_assets == 2:
+            holding = holding.at[:, 1].set(0.0)
+            chex.assert_shape(holding, (batch, n_assets))
+        return next_hidden, holding
+
+    initial = jnp.zeros((batch, hidden), dtype=features.dtype)
+    _, holdings_t = jax.lax.scan(step, initial, xs)
+    chex.assert_shape(holdings_t, (n_time, batch, n_assets))
+    holdings = jnp.swapaxes(holdings_t, 0, 1)
+    chex.assert_shape(holdings, (batch, n_time, n_assets))
+    return holdings
+
+
+def strategy_apply(strategy: Strategy, features: Array, config: StrategyConfig, training: bool) -> tuple[Array, Strategy]:
+    """Dispatch to the BN+MLP or GRU+LayerNorm policy; inputs are parameters/features/mode, outputs
+    holdings/new strategy (BN running stats updated for MLPCore, unchanged for GRUCore)."""
+
+    if isinstance(strategy.core, GRUCore):
+        holdings = _gru_apply(strategy.core, features, config)
+        return holdings, strategy
+    holdings, new_core = _mlp_apply(strategy.core, features, config, training)
+    return holdings, eqx.tree_at(lambda s: s.core, strategy, new_core)
 
 
 def pathwise_hedging_loss(strategy: Strategy, prices: Array, features: Array, epsilon: float,
@@ -756,6 +901,18 @@ def robust_hedging_loss(
     return objective, (pathwise_losses, transport_cost, log_weights, *flat_diagnostics), updated
 
 
+def merge_batchnorm_state(strategy: Strategy, bn_strategy: Strategy) -> Strategy:
+    """Fold BN running stats from a forward pass into a strategy; inputs old/BN-updated strategy,
+    output the merged strategy. GRUCore has no train/eval-dependent state, so this is a no-op then."""
+
+    if isinstance(strategy.core, MLPCore):
+        new_core = eqx.tree_at(lambda c: (c.mean1, c.var1, c.mean2, c.var2), strategy.core,
+                               (bn_strategy.core.mean1, bn_strategy.core.var1,
+                                bn_strategy.core.mean2, bn_strategy.core.var2))
+        return eqx.tree_at(lambda s: s.core, strategy, new_core)
+    return strategy
+
+
 def make_steps(optimizer: optax.GradientTransformation, strategy_config: StrategyConfig,
                epsilon: float, alpha: float = 0.95, strike: float = 100.0):
     """Create top-level jitted train/eval callables; inputs optimizer/config/cost, outputs compiled steps."""
@@ -775,8 +932,7 @@ def make_steps(optimizer: optax.GradientTransformation, strategy_config: Strateg
         grads = eqx.tree_at(lambda g: g.cash, grads, jnp.zeros_like(grads.cash))
         updates, opt_state = optimizer.update(grads, opt_state, strategy)
         strategy = eqx.apply_updates(strategy, updates)
-        strategy = eqx.tree_at(lambda s: (s.mean1, s.var1, s.mean2, s.var2), strategy,
-                               (bn_strategy.mean1, bn_strategy.var1, bn_strategy.mean2, bn_strategy.var2))
+        strategy = merge_batchnorm_state(strategy, bn_strategy)
         grad_norm = optax.global_norm(grads)
         chex.assert_shape(loss, ())
         chex.assert_shape(grad_norm, ())
@@ -846,9 +1002,7 @@ def make_robust_steps(
         grads = (strategy_grads, robust_grads)
         updates, opt_state = optimizer.update(grads, opt_state, parameters)
         strategy, robust_state = eqx.apply_updates(parameters, updates)
-        strategy = eqx.tree_at(
-            lambda candidate: (candidate.mean1, candidate.var1, candidate.mean2, candidate.var2),
-            strategy, (bn_strategy.mean1, bn_strategy.var1, bn_strategy.mean2, bn_strategy.var2))
+        strategy = merge_batchnorm_state(strategy, bn_strategy)
         grad_norm = optax.global_norm(grads)
         chex.assert_shape(loss, ())
         chex.assert_shape(grad_norm, ())
@@ -895,8 +1049,12 @@ def train(
             raise ValueError("proposal_samples and initial_lambda must be positive")
     key = jax.random.PRNGKey(config.training.seed)
     key, init_key, standardization_key, validation_key, validation_proposal_key = jax.random.split(key, 5)
-    strategy = initialize_strategy(init_key, config.market)
-    optimizer = optax.adam(config.training.learning_rate)
+    strategy = initialize_strategy(init_key, config.market, config.strategy)
+    if config.training.grad_clip_norm is None:
+        optimizer = optax.adam(config.training.learning_rate)
+    else:
+        optimizer = optax.chain(optax.clip_by_global_norm(config.training.grad_clip_norm),
+                                optax.adam(config.training.learning_rate))
     simulate_training = jax.jit(lambda simulation_key: simulate_market(
         simulation_key, config.market, config.training.batch_size))
     simulate_validation = jax.jit(lambda simulation_key: simulate_market(
@@ -1117,7 +1275,7 @@ def save_artifacts(
         diagnostic_prices, diagnostic_features = simulate_black_scholes(
             jax.random.PRNGKey(config.training.seed + 20_000), config.market, 4_096)
         diagnostic_learned, _ = strategy_apply(strategy, diagnostic_features, config.strategy, False)
-        times = jnp.arange(config.market.n_time, dtype=strategy.w1.dtype) * (config.market.horizon / config.market.n_time)
+        times = jnp.arange(config.market.n_time, dtype=strategy.cash.dtype) * (config.market.horizon / config.market.n_time)
         chex.assert_shape(times, (config.market.n_time,))
         tau = config.market.horizon - times
         chex.assert_shape(tau, (config.market.n_time,))

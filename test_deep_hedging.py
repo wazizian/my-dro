@@ -93,24 +93,24 @@ def test_strategy_widths_output_and_batch_norm_modes():
         market = MarketConfig(name=name, n_time=3)
         n_assets, n_features = market_dimensions(market)
         assert (n_assets, n_features) == expected
-        strategy = initialize_strategy(jax.random.PRNGKey(n_assets), market)
+        strategy = initialize_strategy(jax.random.PRNGKey(n_assets), market, StrategyConfig())
         features = jax.random.normal(jax.random.PRNGKey(8), (8, 3, n_features))
         holdings, trained = strategy_apply(strategy, features, StrategyConfig(), True)
         chex.assert_shape(holdings, (8, 3, n_assets))
-        assert not np.array_equal(strategy.mean1, trained.mean1)
+        assert not np.array_equal(strategy.core.mean1, trained.core.mean1)
         _, inferred = strategy_apply(trained, features, StrategyConfig(), False)
-        np.testing.assert_array_equal(trained.mean1, inferred.mean1)
+        np.testing.assert_array_equal(trained.core.mean1, inferred.core.mean1)
 
 
 def test_previous_holding_affects_later_decision():
     """Verify the recurrent previous-holding input can alter the following date's network output."""
 
     market = MarketConfig(n_time=2)
-    strategy = initialize_strategy(jax.random.PRNGKey(18), market)
+    strategy = initialize_strategy(jax.random.PRNGKey(18), market, StrategyConfig())
     features = jnp.full((4, 2, 1), jnp.log(100.0))
     baseline, _ = strategy_apply(strategy, features, StrategyConfig(), False)
-    changed_bias = strategy.b3.at[0, 0].add(1.0)
-    changed = eqx.tree_at(lambda candidate: candidate.b3, strategy, changed_bias)
+    changed_bias = strategy.core.b3.at[0, 0].add(1.0)
+    changed = eqx.tree_at(lambda candidate: candidate.core.b3, strategy, changed_bias)
     perturbed, _ = strategy_apply(changed, features, StrategyConfig(), False)
     assert not np.array_equal(baseline[:, 1], perturbed[:, 1])
 
@@ -119,17 +119,17 @@ def test_zero_and_constant_strategy_accounting():
     """Verify zero gains/costs and that constant holdings incur only the initial trade cost."""
 
     market = MarketConfig(n_time=3, horizon=3 / 365)
-    strategy = initialize_strategy(jax.random.PRNGKey(3), market)
-    strategy = eqx.tree_at(lambda s: (s.w1, s.b1, s.w2, s.b2, s.w3, s.b3), strategy,
-                           tuple(jnp.zeros_like(x) for x in (strategy.w1, strategy.b1, strategy.w2,
-                                                            strategy.b2, strategy.w3, strategy.b3)))
+    strategy = initialize_strategy(jax.random.PRNGKey(3), market, StrategyConfig())
+    strategy = eqx.tree_at(lambda s: (s.core.w1, s.core.b1, s.core.w2, s.core.b2, s.core.w3, s.core.b3), strategy,
+                           tuple(jnp.zeros_like(x) for x in (strategy.core.w1, strategy.core.b1, strategy.core.w2,
+                                                            strategy.core.b2, strategy.core.w3, strategy.core.b3)))
     prices = jnp.asarray([[[100.0], [101.0], [99.0], [102.0]]])
     features = jnp.log(prices[:, :-1])
     _, (_, gains, costs, _, holdings), _ = hedging_loss(strategy, prices, features, 0.01, StrategyConfig(), False)
     np.testing.assert_array_equal(holdings, 0.0)
     np.testing.assert_array_equal(gains, 0.0)
     np.testing.assert_array_equal(costs, 0.0)
-    strategy = eqx.tree_at(lambda s: s.b3, strategy, jnp.ones_like(strategy.b3))
+    strategy = eqx.tree_at(lambda s: s.core.b3, strategy, jnp.ones_like(strategy.core.b3))
     _, (_, gains, costs, _, holdings), _ = hedging_loss(strategy, prices, features, 0.01, StrategyConfig(), False)
     np.testing.assert_allclose(holdings, 1.0)
     np.testing.assert_allclose(gains, 2.0)
@@ -140,7 +140,7 @@ def test_costs_are_exactly_zero_or_nonnegative():
     """Verify epsilon zero removes costs exactly and positive epsilon produces nonnegative costs."""
 
     market = MarketConfig(n_time=3, horizon=3 / 365)
-    strategy = initialize_strategy(jax.random.PRNGKey(13), market)
+    strategy = initialize_strategy(jax.random.PRNGKey(13), market, StrategyConfig())
     prices, features = simulate_black_scholes(jax.random.PRNGKey(14), market, 16)
     _, (_, _, zero_cost, _, _), _ = hedging_loss(strategy, prices, features, 0.0, StrategyConfig(), False)
     _, (_, _, positive_cost, _, _), _ = hedging_loss(strategy, prices, features, 0.01, StrategyConfig(), False)
@@ -153,11 +153,12 @@ def test_hedging_loss_matches_cvar_definition():
     """Verify CVaR equals q plus the scaled mean excess loss for a known loss sample."""
 
     market = MarketConfig(n_time=1, horizon=1 / 365)
-    strategy = initialize_strategy(jax.random.PRNGKey(19), market)
-    network_leaves = (strategy.w1, strategy.b1, strategy.w2, strategy.b2, strategy.w3, strategy.b3)
+    strategy = initialize_strategy(jax.random.PRNGKey(19), market, StrategyConfig())
+    network_leaves = (strategy.core.w1, strategy.core.b1, strategy.core.w2,
+                      strategy.core.b2, strategy.core.w3, strategy.core.b3)
     strategy = eqx.tree_at(
-        lambda candidate: (candidate.w1, candidate.b1, candidate.w2,
-                           candidate.b2, candidate.w3, candidate.b3),
+        lambda candidate: (candidate.core.w1, candidate.core.b1, candidate.core.w2,
+                           candidate.core.b2, candidate.core.w3, candidate.core.b3),
         strategy,
         tuple(jnp.zeros_like(leaf) for leaf in network_leaves),
     )
@@ -180,7 +181,7 @@ def test_jitted_optimizer_step_is_finite_and_updates_parameters():
     """Verify one top-level compiled Adam step returns finite values and changes trainable leaves."""
 
     market = MarketConfig(n_time=3, horizon=3 / 365)
-    strategy = initialize_strategy(jax.random.PRNGKey(4), market)
+    strategy = initialize_strategy(jax.random.PRNGKey(4), market, StrategyConfig())
     prices, features = simulate_black_scholes(jax.random.PRNGKey(5), market, 32)
     optimizer = optax.adam(0.005)
     state = optimizer.init(eqx.filter(strategy, eqx.is_array))
@@ -197,7 +198,7 @@ def test_jitted_robust_optimizer_step_is_finite(name, objective):
     """Verify both WDRO objectives compile and update model/dual state for both supported markets."""
 
     market = MarketConfig(name=name, n_time=2, horizon=2 / 365)
-    strategy = initialize_strategy(jax.random.PRNGKey(23), market)
+    strategy = initialize_strategy(jax.random.PRNGKey(23), market, StrategyConfig())
     dimension = market.n_time if name == "black_scholes" else 2 * market.n_time
     robust_state = RobustState(
         jnp.asarray(0.0), jnp.asarray(0.0), jnp.zeros((dimension,)), jnp.ones((dimension,)))
@@ -234,7 +235,7 @@ def test_short_fixed_batch_training_reduces_loss():
     """Verify fixed validation CVaR falls after training on a separate fixed batch."""
 
     market = MarketConfig(n_time=3, horizon=3 / 365)
-    strategy = initialize_strategy(jax.random.PRNGKey(6), market)
+    strategy = initialize_strategy(jax.random.PRNGKey(6), market, StrategyConfig())
     prices, features = simulate_black_scholes(jax.random.PRNGKey(7), market, 128)
     validation_prices, validation_features = simulate_black_scholes(jax.random.PRNGKey(17), market, 128)
     optimizer = optax.adam(0.005)
@@ -257,7 +258,7 @@ def test_artifacts_and_checkpoint_round_trip(tmp_path):
     config = Config()
     config.evaluation.output_dir = str(tmp_path)
     config.market.n_time = 2
-    strategy = initialize_strategy(jax.random.PRNGKey(15), config.market)
+    strategy = initialize_strategy(jax.random.PRNGKey(15), config.market, config.strategy)
     history = {"step": [0], "train_loss": [1.0], "validation_loss": [1.1], "grad_norm": [0.5]}
     metrics = {"mse": 1.2, "cvar": 1.5, "cash": 0.0, "error_mean": 0.0, "error_std": 1.0,
                "error_quantiles": [0.0] * 5, "mean_cost": 0.0, "mean_turnover": 0.0,
@@ -279,7 +280,7 @@ def test_robust_artifacts_and_dual_checkpoint_round_trip(tmp_path):
     robust_config = RobustConfig(enabled=True, objective="joint_cvar", ula_steps=1)
     config = Config(market=market, robust=robust_config)
     config.evaluation.output_dir = str(tmp_path)
-    strategy = initialize_strategy(jax.random.PRNGKey(26), market)
+    strategy = initialize_strategy(jax.random.PRNGKey(26), market, config.strategy)
     robust_state = RobustState(
         jnp.asarray(0.2), jnp.asarray(0.3), jnp.zeros((4,)), jnp.ones((4,)))
     history = {"step": [0], "train_loss": [1.0], "validation_loss": [1.1],

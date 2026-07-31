@@ -26,15 +26,28 @@ from wdro import RobustConfig
 Array = jax.Array
 Dataset = tuple[Array, Array, Array | None]
 
-METHODS = ("cvar", "cvar_of_average", "relaxed_kl_wdro")
+METHODS = ("cvar", "cvar_of_average", "relaxed_kl_wdro", "relaxed_kl_wdro_convex")
+
+# Strike grid + lambda_ij training mode for the convex-order penalty (relaxed_kl_wdro_convex),
+# per probe evidence: wide strikes clearly beat default/tight/atm-only, and trainable lambda_ij
+# clearly beats a fixed penalty weight (see conversation preceding this sweep design).
+CONVEX_ORDER_STRIKES = (80.0, 100.0, 120.0)
 N_GRID = (100, 250, 500, 750, 1000)
 SEEDS = (0, 1, 2)
 N_MAX = 1000
 N_TEST = 20_000
-K_FOLDS = 3
+K_FOLDS = 5
 STEPS = 2000
 BATCH_SIZE = 64
 CANONICAL_ALPHA = 0.95
+# GPU-study additions: proportional transaction cost (10bps, standard equity-option friction
+# magnitude), a fixed (not swept) latent memory channel for the recurrent hedging policy (this
+# implicitly selects the GRU+LayerNorm architecture over the legacy BN+MLP one -- see
+# deep_hedging.py's initialize_strategy/strategy_apply), and a grad-norm clipping safety net
+# (defense in depth alongside the GRU's gating/LayerNorm, not a substitute for it).
+EPSILON = 0.001
+LATENT_DIM = 4
+GRAD_CLIP_NORM = 1.0
 
 # In-distribution / 3-tier leverage-shift severity ladder, per lsv.md S1/S4. weak/medium/hard are
 # 1.5x/2x/3x multiples of the in_dist (leverage_beta, leverage_kappa) offset from zero.
@@ -50,10 +63,14 @@ SHIFT_TIERS = ("weak", "medium", "hard")
 _TAG_OFFSETS = {"train_pool": 0, "test_indist": 1, "test_weak": 2, "test_medium": 3, "test_hard": 4}
 
 
-def lsv_market(variant: Literal["in_dist", "weak", "medium", "hard"]) -> MarketConfig:
-    """Build the LSV MarketConfig for a leverage variant; input variant name, output MarketConfig."""
+def lsv_market(variant: Literal["in_dist", "weak", "medium", "hard"], n_time: int = 252) -> MarketConfig:
+    """Build the LSV MarketConfig for a leverage variant; input variant name/n_time, output MarketConfig.
 
-    return MarketConfig(name="lsv", n_time=100, horizon=100.0 / 365.0, dtype="float32",
+    n_time also sets horizon (1 trading day per step, n_time/365 years) so the two stay
+    consistent -- overriding n_time is mainly for fast smoke/integration tests, not the study.
+    """
+
+    return MarketConfig(name="lsv", n_time=n_time, horizon=n_time / 365.0, dtype="float32",
                         n_substeps=10, **LEVERAGE_PARAMS[variant])
 
 
@@ -104,7 +121,7 @@ def grid_for(method: str) -> list[dict[str, float]]:
     if method == "cvar_of_average":
         return [{"learning_rate": lr, "proposal_scale": scale, "alpha": alpha}
                 for lr in (0.002, 0.01) for scale in (0.05, 0.2) for alpha in (0.90, 0.99)]
-    if method == "relaxed_kl_wdro":
+    if method in ("relaxed_kl_wdro", "relaxed_kl_wdro_convex"):
         return [{"learning_rate": lr, "rho": rho, "alpha": alpha}
                 for lr in (0.002, 0.01) for rho in (0.03, 0.3) for alpha in (0.90, 0.99)]
     raise ValueError(f"unknown method: {method}")
@@ -114,7 +131,8 @@ def method_config(method: str, hp: dict[str, float], market: MarketConfig, steps
     """Build a full Config for one method/hyperparameter combo; inputs method/hp/market, output Config."""
 
     training = TrainingConfig(steps=steps, batch_size=BATCH_SIZE, learning_rate=hp["learning_rate"],
-                              validation_frequency=max(steps // 10, 1), seed=seed)
+                              validation_frequency=max(steps // 10, 1), seed=seed,
+                              grad_clip_norm=GRAD_CLIP_NORM)
     evaluation = EvaluationConfig()
     if method == "cvar":
         robust = RobustConfig(enabled=False)
@@ -124,10 +142,15 @@ def method_config(method: str, hp: dict[str, float], market: MarketConfig, steps
     elif method == "relaxed_kl_wdro":
         robust = RobustConfig(enabled=True, objective="relaxed_kl_cvar", proposal_samples=32,
                               kl_epsilon=0.03, ula_steps=0, cost_power=2, rho=hp["rho"], alpha=hp["alpha"])
+    elif method == "relaxed_kl_wdro_convex":
+        robust = RobustConfig(enabled=True, objective="relaxed_kl_cvar", proposal_samples=32,
+                              kl_epsilon=0.03, ula_steps=0, cost_power=2, rho=hp["rho"], alpha=hp["alpha"],
+                              enforce_convex_order=True, convex_order_strikes=CONVEX_ORDER_STRIKES,
+                              convex_order_lambda_init=1.0, fix_convex_order_lambda=False)
     else:
         raise ValueError(f"unknown method: {method}")
-    return Config(market=market, strategy=StrategyConfig(), training=training, evaluation=evaluation,
-                 robust=robust, epsilon=0.0, alpha=hp["alpha"])
+    return Config(market=market, strategy=StrategyConfig(latent_dim=LATENT_DIM), training=training,
+                 evaluation=evaluation, robust=robust, epsilon=EPSILON, alpha=hp["alpha"])
 
 
 def empirical_cvar95(losses: np.ndarray) -> float:
@@ -184,19 +207,20 @@ def kfold_score(method: str, hp: dict[str, float], n: int, seed: int, pool: Data
 
 
 def run_one(method: str, n: int, seed: int, cache_dir: Path, k: int = K_FOLDS, steps: int = STEPS,
-           n_max: int = N_MAX, n_test: int = N_TEST, retrain: bool = True) -> dict:
+           n_max: int = N_MAX, n_test: int = N_TEST, retrain: bool = True, n_time: int = 252) -> dict:
     """Tune, (re)fit, and test-evaluate one (method, n, seed) cell; inputs cell spec, output a results row.
 
     retrain=False skips the separate full-n refit and instead reuses the winning hyperparameter
     combo's already-trained model directly -- only valid with k=1 (a single train/val split), since
     with k>1 there'd be k candidate models per combo and no principled single choice among them.
+    n_time overrides the market's horizon -- only for fast smoke/integration tests, not the study.
     """
 
     if not retrain and k != 1:
         raise ValueError("retrain=False requires k=1 (single train/val split); ambiguous with k>1 folds")
 
-    market_indist = lsv_market("in_dist")
-    shift_markets = {tier: lsv_market(tier) for tier in SHIFT_TIERS}
+    market_indist = lsv_market("in_dist", n_time)
+    shift_markets = {tier: lsv_market(tier, n_time) for tier in SHIFT_TIERS}
     train_pool = load_or_simulate(cache_dir, seed, "train_pool", market_indist, n_max)
     test_indist = load_or_simulate(cache_dir, seed, "test_indist", market_indist, n_test)
     shift_test_sets = {tier: load_or_simulate(cache_dir, seed, f"test_{tier}", shift_markets[tier], n_test)
@@ -233,7 +257,8 @@ CSV_FIELDNAMES = ["method", "n", "seed", "kfold_val_cvar95", "test_cvar95_indist
 
 
 def run_sweep(methods, n_values, seeds, cache_dir: Path, output_csv: Path, k: int = K_FOLDS,
-             steps: int = STEPS, n_max: int = N_MAX, n_test: int = N_TEST, retrain: bool = True) -> None:
+             steps: int = STEPS, n_max: int = N_MAX, n_test: int = N_TEST, retrain: bool = True,
+             n_time: int = 252) -> None:
     """Run the full method x n x seed sweep, writing each row to CSV as soon as it's ready; inputs
     sweep spec, output none. Incremental writes mean a crash/interrupt only loses the in-flight
     cell, not already-finished cells -- important since a full sweep runs for hours."""
@@ -245,7 +270,7 @@ def run_sweep(methods, n_values, seeds, cache_dir: Path, output_csv: Path, k: in
             for n in n_values:
                 for seed in seeds:
                     print(f"running method={method} n={n} seed={seed}")
-                    row = run_one(method, n, seed, cache_dir, k, steps, n_max, n_test, retrain)
+                    row = run_one(method, n, seed, cache_dir, k, steps, n_max, n_test, retrain, n_time)
                     writer.writerow(row)
                     handle.flush()
 
@@ -261,6 +286,9 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--n-max", type=int, default=N_MAX)
     parser.add_argument("--n-test", type=int, default=N_TEST)
+    parser.add_argument("--n-time", type=int, default=252,
+                       help="market horizon in trading days (also sets horizon=n_time/365); "
+                            "override only for fast smoke/integration tests, not the study")
     parser.add_argument("--cache-dir", type=Path, default=Path("lsv_cache"))
     parser.add_argument("--output", type=Path, default=Path("lsv_sweep_results.csv"))
     parser.add_argument("--retrain", dest="retrain", action="store_true", default=True,
@@ -270,7 +298,7 @@ def main() -> None:
                             "already-trained model directly (requires --k 1)")
     args = parser.parse_args()
     run_sweep(args.methods, args.n_values, args.seeds, args.cache_dir, args.output,
-             args.k, args.steps, args.n_max, args.n_test, args.retrain)
+             args.k, args.steps, args.n_max, args.n_test, args.retrain, args.n_time)
 
 
 if __name__ == "__main__":
