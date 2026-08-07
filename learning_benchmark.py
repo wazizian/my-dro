@@ -35,7 +35,7 @@ from deep_hedging import (
 from wdro import RobustConfig, RobustState
 
 Array = jax.Array
-Mode = Literal["nominal", "entropic", "joint_cvar"]
+Mode = Literal["nominal", "entropic", "relaxed_kl_cvar"]
 
 
 @chex.dataclass
@@ -43,7 +43,7 @@ class LearningBenchmarkConfig:
     """Configure the small learning benchmark; fields control its shared budget and output."""
 
     steps: int = 500
-    mode: Literal["all", "nominal", "entropic", "joint_cvar"] = "all"
+    mode: Literal["all", "nominal", "entropic", "relaxed_kl_cvar"] = "all"
     batch_size: int = 64
     validation_size: int = 2_048
     evaluation_size: int = 10_000
@@ -204,7 +204,7 @@ def native_evaluation(
     normalized_ess = jnp.mean(effective_sample_size) / n_proposals
     chex.assert_shape(normalized_ess, ())
     active_value = (
-        float(active_fraction) if config.robust.objective == "joint_cvar" else None)
+        float(active_fraction) if config.robust.objective == "relaxed_kl_cvar" else None)
     return float(objective), active_value, float(normalized_ess)
 
 
@@ -229,7 +229,7 @@ def run_mode(mode: Mode, benchmark: LearningBenchmarkConfig, directory: Path) ->
     initial, robust_state, validation_prices, validation_features, proposal_key, _ = (
         initial_state_and_data(config))
     initial = calibrate(initial, validation_features, config.strategy)
-    if mode == "joint_cvar" and robust_state is not None:
+    if mode == "relaxed_kl_cvar" and robust_state is not None:
         _, evaluate = make_robust_steps(
             optax.adam(config.training.learning_rate), config.market, config.strategy,
             config.robust, config.epsilon)
@@ -277,9 +277,9 @@ def run_mode(mode: Mode, benchmark: LearningBenchmarkConfig, directory: Path) ->
     )
     risk_improving = bool(cvar_improvement >= 0.02 or stop_improvement >= 0.02)
     tail_calibrated = True
-    if mode == "joint_cvar":
+    if mode == "relaxed_kl_cvar":
         if trained_active is None:
-            raise ValueError("joint CVaR evaluation must return an active-tail fraction")
+            raise ValueError("relaxed-KL-CVaR evaluation must return an active-tail fraction")
         tail_calibrated = 0.02 <= trained_active <= 0.15
     proposal_healthy = bool(
         benchmark.ula_steps == 0
@@ -336,7 +336,7 @@ def main(benchmark: LearningBenchmarkConfig) -> None:
     (directory / "benchmark_config.json").write_text(
         json.dumps(dataclasses.asdict(benchmark), indent=2))
     modes: tuple[Mode, ...] = (
-        ("nominal", "entropic", "joint_cvar")
+        ("nominal", "entropic", "relaxed_kl_cvar")
         if benchmark.mode == "all" else (benchmark.mode,))
     results = [run_mode(mode, benchmark, directory) for mode in modes]
     fields = [

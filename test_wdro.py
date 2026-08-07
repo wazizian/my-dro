@@ -13,9 +13,7 @@ from wdro import (
     RobustConfig,
     RobustState,
     entropic_dual,
-    joint_cvar_dual,
     quadratic_transport_cost,
-    plain_average_dual,
     plain_cvar_of_average_dual,
     relaxed_kl_cvar_dual,
     sample_langevin_proposal,
@@ -230,24 +228,6 @@ def test_entropic_dual_is_finite_for_large_losses():
     assert bool(jnp.isfinite(objective))
 
 
-def test_joint_cvar_dual_uses_one_scalar_eta_and_joint_expectation():
-    """Verify joint CVaR pools base/proposal samples and uses one scalar threshold."""
-
-    lambda_value = 0.25
-    eta = jnp.asarray(0.6)
-    chex.assert_shape(eta, ())
-    state = RobustState(inverse_softplus(lambda_value), eta, jnp.zeros((0,)), jnp.ones((0,)))
-    config = RobustConfig(objective="joint_cvar", rho=0.2, alpha=0.75)
-    losses = jnp.asarray([[0.0, 1.0], [2.0, 4.0]])
-    costs = jnp.asarray([[0.0, 0.2], [0.4, 0.8]])
-    log_weights = jnp.zeros((2, 2))
-    objective = joint_cvar_dual(state, losses, costs, log_weights, config)
-    penalized = np.asarray(losses) - lambda_value * np.asarray(costs)
-    expected = lambda_value * config.rho + float(eta) + np.mean(
-        np.maximum(penalized - float(eta), 0.0)) / (1.0 - config.alpha)
-    np.testing.assert_allclose(objective, expected, rtol=2e-6)
-
-
 def test_relaxed_kl_cvar_dual_matches_manual_h_lambda_wrap():
     """Verify relaxed-kl-cvar wraps the per-anchor entropic h_lambda in a joint L^1 tail."""
 
@@ -284,34 +264,6 @@ def test_relaxed_kl_cvar_dual_reduces_to_entropic_when_eta_below_min_h_lambda():
     expected = entropic_dual(entropic_state, losses, costs, log_weights, entropic_config)
     objective = relaxed_kl_cvar_dual(state, losses, costs, log_weights, config)
     np.testing.assert_allclose(objective, expected, rtol=1e-5)
-
-
-def test_plain_average_dual_matches_manual_mean():
-    """Verify plain_average_dual is exactly the mean pathwise loss over anchors and proposals."""
-
-    state = RobustState(inverse_softplus(0.3), jnp.asarray(0.5), jnp.zeros((0,)), jnp.ones((0,)))
-    config = RobustConfig(objective="plain_average", rho=0.2)
-    losses = jnp.asarray([[1.0, 2.0, -3.0], [0.5, -1.5, 4.0]])
-    costs = jnp.asarray([[0.0, 0.5, 1.0], [0.2, 0.4, 0.6]])
-    log_weights = jnp.zeros((2, 3))
-    objective = plain_average_dual(state, losses, costs, log_weights, config)
-    np.testing.assert_allclose(objective, np.mean(np.asarray(losses)), rtol=1e-6)
-
-
-def test_plain_average_dual_ignores_lambda_and_transport_cost():
-    """Verify changing lambda or transport_cost leaves plain_average_dual unchanged."""
-
-    losses = jnp.asarray([[1.0, 2.0], [-1.0, 3.0]])
-    log_weights = jnp.zeros((2, 2))
-    config = RobustConfig(objective="plain_average", rho=0.2)
-    baseline_costs = jnp.zeros((2, 2))
-    baseline_state = RobustState(inverse_softplus(0.1), jnp.asarray(0.0), jnp.zeros((0,)), jnp.ones((0,)))
-    baseline = plain_average_dual(baseline_state, losses, baseline_costs, log_weights, config)
-
-    perturbed_costs = jnp.asarray([[0.0, 5.0], [10.0, 0.25]])
-    perturbed_state = RobustState(inverse_softplus(9.0), jnp.asarray(0.0), jnp.zeros((0,)), jnp.ones((0,)))
-    perturbed = plain_average_dual(perturbed_state, losses, perturbed_costs, log_weights, config)
-    np.testing.assert_allclose(baseline, perturbed, rtol=1e-6)
 
 
 def test_plain_cvar_of_average_dual_matches_manual_cvar_of_mean():
@@ -363,7 +315,7 @@ def test_plain_cvar_of_average_dual_exact_eta_matches_empirical_quantile():
 
 
 @pytest.mark.parametrize(
-    "objective", ["entropic", "joint_cvar", "relaxed_kl_cvar", "plain_average", "plain_cvar_of_average"])
+    "objective", ["entropic", "relaxed_kl_cvar", "plain_cvar_of_average"])
 def test_jitted_dual_has_finite_parameter_gradients(objective):
     """Verify each top-level-jitted dual has finite gradients in lambda and scalar eta."""
 
@@ -374,9 +326,7 @@ def test_jitted_dual_has_finite_parameter_gradients(objective):
     log_weights = jnp.zeros((2, 2))
     dual_by_objective = {
         "entropic": entropic_dual,
-        "joint_cvar": joint_cvar_dual,
         "relaxed_kl_cvar": relaxed_kl_cvar_dual,
-        "plain_average": plain_average_dual,
         "plain_cvar_of_average": plain_cvar_of_average_dual,
     }
     dual = dual_by_objective[objective]

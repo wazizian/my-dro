@@ -10,6 +10,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
 from deep_hedging import (
     Config,
@@ -17,16 +18,19 @@ from deep_hedging import (
     MarketConfig,
     StrategyConfig,
     TrainingConfig,
+    encode_trajectory,
+    initialize_strategy,
+    make_robust_steps,
     pathwise_hedging_loss,
     simulate_market,
     train,
 )
-from wdro import RobustConfig
+from wdro import RobustConfig, RobustState
 
 Array = jax.Array
 Dataset = tuple[Array, Array, Array | None]
 
-METHODS = ("cvar", "cvar_of_average", "relaxed_kl_wdro", "relaxed_kl_wdro_convex")
+METHODS = ("cvar", "relaxed_kl_wdro", "relaxed_kl_wdro_convex")
 
 # Strike grid + lambda_ij training mode for the convex-order penalty (relaxed_kl_wdro_convex),
 # per probe evidence: wide strikes clearly beat default/tight/atm-only, and trainable lambda_ij
@@ -36,8 +40,8 @@ N_GRID = (100, 250, 500, 750, 1000)
 SEEDS = (0, 1, 2)
 N_MAX = 1000
 N_TEST = 20_000
-K_FOLDS = 5
-STEPS = 2000
+K_FOLDS = 4
+STEPS = 500
 BATCH_SIZE = 64
 CANONICAL_ALPHA = 0.95
 # GPU-study additions: proportional transaction cost (10bps, standard equity-option friction
@@ -63,7 +67,7 @@ SHIFT_TIERS = ("weak", "medium", "hard")
 _TAG_OFFSETS = {"train_pool": 0, "test_indist": 1, "test_weak": 2, "test_medium": 3, "test_hard": 4}
 
 
-def lsv_market(variant: Literal["in_dist", "weak", "medium", "hard"], n_time: int = 252) -> MarketConfig:
+def lsv_market(variant: Literal["in_dist", "weak", "medium", "hard"], n_time: int = 100) -> MarketConfig:
     """Build the LSV MarketConfig for a leverage variant; input variant name/n_time, output MarketConfig.
 
     n_time also sets horizon (1 trading day per step, n_time/365 years) so the two stay
@@ -112,18 +116,22 @@ def prefix(dataset: Dataset, n: int) -> Dataset:
     return prices[:n], features[:n], None if variance is None else variance[:n]
 
 
-def grid_for(method: str) -> list[dict[str, float]]:
-    """Return the hyperparameter grid for a method, per lsv.md S3; input method name, output config list."""
+# rho scaled as c / sqrt(n) (standard Wasserstein-radius shrinkage rate) rather than a fixed
+# grid -- 4 constants, log-spaced, tuned per-n instead of reusing the same raw rho across n.
+RHO_CONSTANTS = (0.3, 1.0, 3.0, 10.0)
+
+
+def grid_for(method: str, n: int) -> list[dict[str, float]]:
+    """Return the hyperparameter grid for a method at pool size n; inputs method/n, output config list."""
 
     if method == "cvar":
-        return [{"learning_rate": lr, "alpha": alpha}
-                for lr in (0.002, 0.005, 0.01) for alpha in (0.90, 0.95, 0.99)]
+        return [{"learning_rate": lr, "alpha": CANONICAL_ALPHA} for lr in (0.002, 0.005, 0.01)]
     if method == "cvar_of_average":
-        return [{"learning_rate": lr, "proposal_scale": scale, "alpha": alpha}
-                for lr in (0.002, 0.01) for scale in (0.05, 0.2) for alpha in (0.90, 0.99)]
+        return [{"learning_rate": lr, "proposal_scale": scale, "alpha": CANONICAL_ALPHA}
+                for lr in (0.002, 0.01) for scale in (0.05, 0.2)]
     if method in ("relaxed_kl_wdro", "relaxed_kl_wdro_convex"):
-        return [{"learning_rate": lr, "rho": rho, "alpha": alpha}
-                for lr in (0.002, 0.01) for rho in (0.03, 0.3) for alpha in (0.90, 0.99)]
+        return [{"learning_rate": lr, "rho": c / np.sqrt(n), "alpha": CANONICAL_ALPHA}
+                for lr in (0.002, 0.01) for c in RHO_CONSTANTS]
     raise ValueError(f"unknown method: {method}")
 
 
@@ -151,6 +159,76 @@ def method_config(method: str, hp: dict[str, float], market: MarketConfig, steps
         raise ValueError(f"unknown method: {method}")
     return Config(market=market, strategy=StrategyConfig(latent_dim=LATENT_DIM), training=training,
                  evaluation=evaluation, robust=robust, epsilon=EPSILON, alpha=hp["alpha"])
+
+
+# Methods whose dual has a trainable CVaR threshold (RobustState.eta) that benefits from a
+# pilot warm start -- cold-starting at RobustConfig.initial_eta=0.0 forces eta to crawl toward
+# the true dual-optimal value at a roughly lr-capped rate per step, wasting a large fraction of
+# a short training budget just getting eta into the right neighborhood (see lsv_stage3_notes.md
+# convergence probe: eta was still drifting ~linearly after 600 steps, never having plateaued).
+ETA_WARM_START_METHODS = ("relaxed_kl_wdro", "relaxed_kl_wdro_convex", "cvar_of_average")
+PILOT_BATCH_SIZE = 256
+
+
+def robust_scale(values: Array) -> Array:
+    """Floor-guarded std, used as a lambda-init scale estimate; input any array, output positive scalar."""
+
+    return jnp.maximum(jnp.std(values), 1e-6)
+
+
+def pilot_warm_start(method: str, config: Config, market: MarketConfig, seed: int, dataset: Dataset) -> None:
+    """Warm-start a dual's lambda/lambda_ij/eta from an untrained network's pilot batch; mutates config.robust.
+
+    Each penalty multiplier is set so its penalty term starts at the same scale as the pathwise
+    loss f it's subtracted from/added to -- initial_lambda so that lambda * transport_cost is
+    comparable to f (otherwise the softplus(raw_lambda) gradient starts dominated or negligible
+    relative to f's own scale), and convex_order_lambda_init likewise for lambda_ij * (call-price
+    time-difference) against f. eta is then warm-started to the alpha-quantile of the same score
+    the dual actually thresholds on, now computed under the freshly-scaled lambda(s) -- cold
+    defaults (lambda=1, eta=0) otherwise force every dual variable to crawl from an arbitrary
+    starting scale at a roughly lr-capped rate per step (see lsv_stage3_notes.md convergence
+    probe: eta was still drifting ~linearly after 600 steps under the old lambda=1/eta=0 defaults).
+    """
+
+    if method not in ETA_WARM_START_METHODS:
+        return
+    prices, features, variance = dataset
+    n_pilot = min(PILOT_BATCH_SIZE, prices.shape[0])
+    prices, features, variance = prices[:n_pilot], features[:n_pilot], (
+        None if variance is None else variance[:n_pilot])
+    key = jax.random.PRNGKey(seed)
+    init_key, proposal_key = jax.random.split(key)
+    strategy = initialize_strategy(init_key, market, config.strategy)
+
+    if method == "relaxed_kl_wdro_convex":
+        raw_loss, _, _ = pathwise_hedging_loss(
+            strategy, prices, features, config.epsilon, config.strategy, False, market.strike)
+        stock_prices = prices[..., 0]
+        strikes = jnp.asarray(config.robust.convex_order_strikes, dtype=stock_prices.dtype)
+        calls = jax.nn.relu(stock_prices[:, :, None] - strikes[None, None, :])
+        diff = calls[:, :-1, :] - calls[:, 1:, :]
+        config.robust.convex_order_lambda_init = float(robust_scale(raw_loss) / robust_scale(diff))
+
+    coordinates = encode_trajectory(prices, variance, market)
+    location = jnp.mean(coordinates, axis=0)
+    scale = jnp.maximum(jnp.std(coordinates, axis=0), 1e-3)
+    n_strikes = len(config.robust.convex_order_strikes)
+    raw_lambda_ij_init = jnp.log(jnp.expm1(jnp.asarray(config.robust.convex_order_lambda_init)))
+    raw_lambda_ij = jnp.full((n_strikes, market.n_time), raw_lambda_ij_init)
+    robust_state = RobustState(jnp.asarray(0.0), jnp.asarray(0.0), location, scale, raw_lambda_ij)
+    _, evaluate = make_robust_steps(
+        optax.adam(config.training.learning_rate), market, config.strategy, config.robust, config.epsilon)
+    _, diagnostics = evaluate(strategy, robust_state, prices, variance, proposal_key)
+    pathwise_losses, transport_cost, log_weights = diagnostics[:3]
+    if method == "cvar_of_average":
+        # plain_cvar_of_average_dual ignores lambda/transport_cost entirely -- only eta applies.
+        weights = jax.nn.softmax(log_weights, axis=1)
+        score = jnp.sum(weights * pathwise_losses, axis=1)
+    else:
+        config.robust.initial_lambda = float(robust_scale(pathwise_losses) / robust_scale(transport_cost))
+        lambda_ = jax.nn.softplus(jnp.asarray(config.robust.initial_lambda))
+        score = pathwise_losses - lambda_ * transport_cost
+    config.robust.initial_eta = float(jnp.quantile(score, config.robust.alpha))
 
 
 def empirical_cvar95(losses: np.ndarray) -> float:
@@ -200,6 +278,7 @@ def kfold_score(method: str, hp: dict[str, float], n: int, seed: int, pool: Data
         train_mask, val_mask = kfold_split(n, k, fold)
         train_ds = (prices[train_mask], features[train_mask], None if variance is None else variance[train_mask])
         val_ds = (prices[val_mask], features[val_mask], None if variance is None else variance[val_mask])
+        pilot_warm_start(method, config, market, seed, train_ds)
         strategy, _, _ = train(config, train_dataset=train_ds, validation_dataset=val_ds)
         scores.append(evaluate_cvar95(strategy, config.strategy, market, config.epsilon, val_ds))
         strategies.append(strategy)
@@ -207,7 +286,7 @@ def kfold_score(method: str, hp: dict[str, float], n: int, seed: int, pool: Data
 
 
 def run_one(method: str, n: int, seed: int, cache_dir: Path, k: int = K_FOLDS, steps: int = STEPS,
-           n_max: int = N_MAX, n_test: int = N_TEST, retrain: bool = True, n_time: int = 252) -> dict:
+           n_max: int = N_MAX, n_test: int = N_TEST, retrain: bool = True, n_time: int = 100) -> dict:
     """Tune, (re)fit, and test-evaluate one (method, n, seed) cell; inputs cell spec, output a results row.
 
     retrain=False skips the separate full-n refit and instead reuses the winning hyperparameter
@@ -226,13 +305,14 @@ def run_one(method: str, n: int, seed: int, cache_dir: Path, k: int = K_FOLDS, s
     shift_test_sets = {tier: load_or_simulate(cache_dir, seed, f"test_{tier}", shift_markets[tier], n_test)
                        for tier in SHIFT_TIERS}
 
-    grid = grid_for(method)
+    grid = grid_for(method, n)
     scored = [(hp, *kfold_score(method, hp, n, seed, train_pool, market_indist, k, steps)) for hp in grid]
     best_hp, best_score, best_strategies, best_config = min(scored, key=lambda item: item[1])
 
     if retrain:
         full_ds = prefix(train_pool, n)
         config = method_config(method, best_hp, market_indist, steps, seed)
+        pilot_warm_start(method, config, market_indist, seed, full_ds)
         # Refit checkpoint selection uses the training set itself as "validation" (no separate
         # refit-validation split exists in lsv.md S3) -- the held-out test sets must stay untouched
         # until final evaluation below. See lsv_stage3_notes.md choice #1.
@@ -258,7 +338,7 @@ CSV_FIELDNAMES = ["method", "n", "seed", "kfold_val_cvar95", "test_cvar95_indist
 
 def run_sweep(methods, n_values, seeds, cache_dir: Path, output_csv: Path, k: int = K_FOLDS,
              steps: int = STEPS, n_max: int = N_MAX, n_test: int = N_TEST, retrain: bool = True,
-             n_time: int = 252) -> None:
+             n_time: int = 100) -> None:
     """Run the full method x n x seed sweep, writing each row to CSV as soon as it's ready; inputs
     sweep spec, output none. Incremental writes mean a crash/interrupt only loses the in-flight
     cell, not already-finished cells -- important since a full sweep runs for hours."""
@@ -275,6 +355,26 @@ def run_sweep(methods, n_values, seeds, cache_dir: Path, output_csv: Path, k: in
                     handle.flush()
 
 
+def precache(seeds, cache_dir: Path, n_max: int, n_test: int, n_time: int) -> None:
+    """Simulate and cache every dataset a sweep will need, sequentially; inputs seeds/sizes, output none.
+
+    Run this once, single-process, before launching multiple GPU-sharded sweep processes against
+    the same --cache-dir: load_or_simulate only ever writes a cache file on a miss, so two
+    processes racing to simulate the same (seed, tag, n) dataset concurrently could corrupt or
+    duplicate the write. Pre-warming here means every later load_or_simulate call is a cache hit
+    (read-only), so parallel processes never touch the filesystem for the same path at once.
+    """
+
+    market_indist = lsv_market("in_dist", n_time)
+    shift_markets = {tier: lsv_market(tier, n_time) for tier in SHIFT_TIERS}
+    for seed in seeds:
+        print(f"precaching seed={seed}")
+        load_or_simulate(cache_dir, seed, "train_pool", market_indist, n_max)
+        load_or_simulate(cache_dir, seed, "test_indist", market_indist, n_test)
+        for tier in SHIFT_TIERS:
+            load_or_simulate(cache_dir, seed, f"test_{tier}", shift_markets[tier], n_test)
+
+
 def main() -> None:
     """Run the sweep from the CLI; inputs argv flags, output printed progress and a CSV file."""
 
@@ -286,9 +386,8 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--n-max", type=int, default=N_MAX)
     parser.add_argument("--n-test", type=int, default=N_TEST)
-    parser.add_argument("--n-time", type=int, default=252,
-                       help="market horizon in trading days (also sets horizon=n_time/365); "
-                            "override only for fast smoke/integration tests, not the study")
+    parser.add_argument("--n-time", type=int, default=100,
+                       help="market horizon in trading days (also sets horizon=n_time/365)")
     parser.add_argument("--cache-dir", type=Path, default=Path("lsv_cache"))
     parser.add_argument("--output", type=Path, default=Path("lsv_sweep_results.csv"))
     parser.add_argument("--retrain", dest="retrain", action="store_true", default=True,
@@ -296,7 +395,14 @@ def main() -> None:
     parser.add_argument("--no-retrain", dest="retrain", action="store_false",
                        help="skip the full-n refit; reuse the winning hyperparameter combo's "
                             "already-trained model directly (requires --k 1)")
+    parser.add_argument("--precache", action="store_true",
+                       help="only simulate/cache all datasets for --seeds, then exit -- run this "
+                            "once before launching multiple GPU-sharded sweep processes against "
+                            "the same --cache-dir to avoid a concurrent-write race")
     args = parser.parse_args()
+    if args.precache:
+        precache(args.seeds, args.cache_dir, args.n_max, args.n_test, args.n_time)
+        return
     run_sweep(args.methods, args.n_values, args.seeds, args.cache_dir, args.output,
              args.k, args.steps, args.n_max, args.n_test, args.retrain, args.n_time)
 

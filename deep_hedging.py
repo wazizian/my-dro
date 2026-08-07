@@ -21,9 +21,6 @@ from wdro import (
     RobustState,
     convex_order_penalty,
     entropic_dual,
-    joint_cvar_dual,
-    per_sample_cvar_dual,
-    plain_average_dual,
     plain_cvar_of_average_dual,
     relaxed_kl_cvar_dual,
     quadratic_transport_cost,
@@ -882,20 +879,11 @@ def robust_hedging_loss(
     if robust_config.objective == "entropic":
         objective = entropic_dual(
             robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
-    elif robust_config.objective == "per_sample_cvar":
-        objective = per_sample_cvar_dual(
-            robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
     elif robust_config.objective == "relaxed_kl_cvar":
         objective = relaxed_kl_cvar_dual(
             robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
-    elif robust_config.objective == "plain_average":
-        objective = plain_average_dual(
-            robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
-    elif robust_config.objective == "plain_cvar_of_average":
-        objective = plain_cvar_of_average_dual(
-            robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
     else:
-        objective = joint_cvar_dual(
+        objective = plain_cvar_of_average_dual(
             robust_state, pathwise_losses, transport_cost, log_weights, robust_config)
     chex.assert_shape(objective, ())
     return objective, (pathwise_losses, transport_cost, log_weights, *flat_diagnostics), updated
@@ -983,8 +971,7 @@ def make_robust_steps(
         strategy_grads = eqx.tree_at(
             lambda candidate: (candidate.cash, candidate.q), strategy_grads,
             (jnp.zeros_like(strategy_grads.cash), jnp.zeros_like(strategy_grads.q)))
-        if (robust_config.objective in ("entropic", "per_sample_cvar")
-                or (robust_config.objective == "joint_cvar" and robust_config.exact_eta)):
+        if robust_config.objective == "entropic":
             robust_grads = eqx.tree_at(
                 lambda candidate: candidate.eta, robust_grads,
                 jnp.zeros_like(robust_grads.eta))

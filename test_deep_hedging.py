@@ -193,7 +193,7 @@ def test_jitted_optimizer_step_is_finite_and_updates_parameters():
 
 
 @pytest.mark.parametrize("name", ["black_scholes", "heston"])
-@pytest.mark.parametrize("objective", ["entropic", "joint_cvar"])
+@pytest.mark.parametrize("objective", ["entropic", "relaxed_kl_cvar"])
 def test_jitted_robust_optimizer_step_is_finite(name, objective):
     """Verify both WDRO objectives compile and update model/dual state for both supported markets."""
 
@@ -277,7 +277,7 @@ def test_robust_artifacts_and_dual_checkpoint_round_trip(tmp_path):
     """Verify robust runs save their scalar dual variables and fixed coordinate statistics."""
 
     market = MarketConfig(name="heston", n_time=2, horizon=2 / 365)
-    robust_config = RobustConfig(enabled=True, objective="joint_cvar", ula_steps=1)
+    robust_config = RobustConfig(enabled=True, objective="relaxed_kl_cvar", ula_steps=1)
     config = Config(market=market, robust=robust_config)
     config.evaluation.output_dir = str(tmp_path)
     strategy = initialize_strategy(jax.random.PRNGKey(26), market, config.strategy)

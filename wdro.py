@@ -19,8 +19,7 @@ class RobustConfig:
 
     enabled: bool = False
     objective: Literal[
-        "entropic", "joint_cvar", "per_sample_cvar", "relaxed_kl_cvar", "plain_average",
-        "plain_cvar_of_average",
+        "entropic", "relaxed_kl_cvar", "plain_cvar_of_average",
     ] = "entropic"
     rho: float = 0.1
     kl_epsilon: float = 0.1
@@ -281,35 +280,6 @@ def entropic_dual(
     chex.assert_shape(objective, ())
     return objective
 
-
-def plain_average_dual(
-    state: RobustState,
-    pathwise_loss: Array,
-    transport_cost: Array,
-    log_weights: Array,
-    config: RobustConfig,
-) -> Array:
-    """Compute the plain proposal-neighborhood average; inputs are state/path arrays/config, output scalar.
-
-    Confound-isolation baseline: averages the raw pathwise loss over every (anchor, proposal)
-    pair with no worst-case tilt and no transport-cost penalty -- i.e. it sees the same
-    perturbation-kernel-augmented sample budget as entropic_dual/relaxed_kl_cvar_dual (batch *
-    n_proposals forward passes) but with none of the WDRO dual machinery, isolating whether an
-    apparent robustness edge is just an effect of more (perturbed) samples per training step.
-    transport_cost/state.raw_lambda are accepted only to match the other duals' call signature
-    and are intentionally unused. Note: pathwise_loss itself may already include the relaxed
-    convex-order penalty (see convex_order_penalty), which is folded in upstream of every dual
-    dispatch when RobustConfig.enforce_convex_order is set -- that mechanism is independent of
-    this dual's own "no transport-cost penalty" property.
-    """
-
-    del transport_cost, state
-    chex.assert_equal_shape((pathwise_loss, log_weights))
-    objective = jnp.mean(pathwise_loss)
-    chex.assert_shape(objective, ())
-    return objective
-
-
 def plain_cvar_of_average_dual(
     state: RobustState,
     pathwise_loss: Array,
@@ -321,16 +291,13 @@ def plain_cvar_of_average_dual(
 
     The true single-variable alternative to relaxed_kl_cvar_dual: each anchor's proposal
     neighborhood is collapsed to a plain (self-normalized-importance-weighted) average over
-    pi_0 -- no worst-case tilt, no transport-cost penalty -- and then the *same* joint CVaR-style
-    aggregation (eta + L^1-tail-norm/(1-alpha)) used by joint_cvar_dual/relaxed_kl_cvar_dual is
-    applied across the batch of those per-anchor averages. Unlike plain_average_dual (whose
-    outer aggregation is a plain mean, matching entropic_dual's outer form rather than
-    relaxed_kl_cvar_dual's), this holds the outer risk functional fixed to the same CVaR-shaped
-    form relaxed_kl_cvar_dual and nominal's Rockafellar-Uryasev loss both use, isolating the
-    inner tilt as the only remaining difference from relaxed_kl_cvar_dual. transport_cost and
-    state.raw_lambda are accepted only for call-signature compatibility and are unused. Unlike
-    joint_cvar_dual/relaxed_kl_cvar_dual, only the standard tail_power=1.0 (true CVaR, L^1 norm
-    of the positive part) shape is implemented -- config.tail_power is not read. Note:
+    pi_0 -- no worst-case tilt, no transport-cost penalty -- and then the *same* CVaR-style
+    aggregation (eta + L^1-tail-norm/(1-alpha)) used by relaxed_kl_cvar_dual is applied across
+    the batch of those per-anchor averages, isolating the inner tilt as the only remaining
+    difference from relaxed_kl_cvar_dual. transport_cost and state.raw_lambda are accepted only
+    for call-signature compatibility and are unused. Only the standard tail_power=1.0 (true
+    CVaR, L^1 norm of the positive part) shape is implemented -- config.tail_power is not read.
+    Note:
     pathwise_loss itself may already include the relaxed convex-order penalty (see
     convex_order_penalty), folded in upstream of every dual dispatch when
     RobustConfig.enforce_convex_order is set -- independent of this dual's own properties.
@@ -354,56 +321,6 @@ def plain_cvar_of_average_dual(
     objective = eta + jnp.mean(tail) / (1.0 - config.alpha)
     chex.assert_shape(objective, ())
     return objective
-
-
-def joint_cvar_dual(
-    state: RobustState,
-    pathwise_loss: Array,
-    transport_cost: Array,
-    log_weights: Array,
-    config: RobustConfig,
-) -> Array:
-    """Compute the joint-L^p WDRO dual; inputs are state/path arrays/config and output is a scalar objective.
-
-    With config.tail_power == 1.0 this is the standard CVaR-shaped dual (L^1 norm of the
-    positive part). Larger tail_power uses an L^p norm of the positive part instead, which
-    is no longer a CVaR but penalizes large individual tail excesses more sharply. When
-    config.exact_eta is set, eta is not a dual-ascent variable but the exact per-batch
-    (1 - alpha) empirical quantile of the penalized loss (stop-gradient), following the
-    closed-form optimal eta for the p=1 case; for p != 1 this is a heuristic plug-in.
-    """
-
-    chex.assert_equal_shape((pathwise_loss, transport_cost, log_weights))
-    batch, n_proposals = pathwise_loss.shape
-    chex.assert_shape(state.raw_lambda, ())
-    chex.assert_shape(state.eta, ())
-    lambda_ = jax.nn.softplus(state.raw_lambda)
-    chex.assert_shape(lambda_, ())
-    penalized = pathwise_loss - lambda_ * transport_cost
-    chex.assert_shape(penalized, (batch, n_proposals))
-    if config.exact_eta:
-        eta = jax.lax.stop_gradient(jnp.quantile(penalized, config.alpha))
-    else:
-        eta = state.eta
-    chex.assert_shape(eta, ())
-    tail = jax.nn.relu(penalized - eta)
-    chex.assert_shape(tail, (batch, n_proposals))
-    safe_tail = jnp.maximum(tail, jnp.finfo(tail.dtype).tiny)
-    chex.assert_shape(safe_tail, (batch, n_proposals))
-    log_tail = jnp.where(tail > 0.0, jnp.log(safe_tail), -jnp.inf)
-    chex.assert_shape(log_tail, (batch, n_proposals))
-    log_weighted_tail_power = log_weights + config.tail_power * log_tail
-    chex.assert_shape(log_weighted_tail_power, (batch, n_proposals))
-    log_tail_power_mean = (jax.scipy.special.logsumexp(log_weighted_tail_power)
-                           - jnp.log(batch * n_proposals))
-    chex.assert_shape(log_tail_power_mean, ())
-    weighted_tail_norm = jnp.where(
-        jnp.all(tail == 0.0), 0.0, jnp.exp(log_tail_power_mean / config.tail_power))
-    chex.assert_shape(weighted_tail_norm, ())
-    objective = lambda_ * config.rho + eta + weighted_tail_norm / (1.0 - config.alpha)
-    chex.assert_shape(objective, ())
-    return objective
-
 
 def relaxed_kl_cvar_dual(
     state: RobustState,
@@ -453,52 +370,5 @@ def relaxed_kl_cvar_dual(
     tail_norm = jnp.where(jnp.all(tail == 0.0), 0.0, jnp.exp(log_tail_power_mean / config.tail_power))
     chex.assert_shape(tail_norm, ())
     objective = lambda_ * config.rho + eta + tail_norm / (1.0 - config.alpha)
-    chex.assert_shape(objective, ())
-    return objective
-
-
-def per_sample_cvar_dual(
-    state: RobustState,
-    pathwise_loss: Array,
-    transport_cost: Array,
-    log_weights: Array,
-    config: RobustConfig,
-) -> Array:
-    """Compute the conditional-L^p WDRO dual; inputs are state/path arrays/config and output is a scalar objective.
-
-    Implements the conditional (per-sample) constraint from note_wdro_solve.typ's
-    @conditional-dual, as opposed to joint_cvar_dual's single shared threshold
-    (@joint-dual): every anchor xi gets its own eta(xi), computed exactly as the
-    (1 - alpha) empirical quantile of that anchor's own proposal batch (stop-gradient).
-    There is no persistent per-sample dual variable to learn (anchors change every
-    step), so eta is always computed on the fly here regardless of config.exact_eta.
-    """
-
-    chex.assert_equal_shape((pathwise_loss, transport_cost, log_weights))
-    batch, n_proposals = pathwise_loss.shape
-    chex.assert_shape(state.raw_lambda, ())
-    lambda_ = jax.nn.softplus(state.raw_lambda)
-    chex.assert_shape(lambda_, ())
-    penalized = pathwise_loss - lambda_ * transport_cost
-    chex.assert_shape(penalized, (batch, n_proposals))
-    eta = jax.lax.stop_gradient(jnp.quantile(penalized, config.alpha, axis=1))
-    chex.assert_shape(eta, (batch,))
-    tail = jax.nn.relu(penalized - eta[:, None])
-    chex.assert_shape(tail, (batch, n_proposals))
-    safe_tail = jnp.maximum(tail, jnp.finfo(tail.dtype).tiny)
-    chex.assert_shape(safe_tail, (batch, n_proposals))
-    log_tail = jnp.where(tail > 0.0, jnp.log(safe_tail), -jnp.inf)
-    chex.assert_shape(log_tail, (batch, n_proposals))
-    log_weighted_tail_power = log_weights + config.tail_power * log_tail
-    chex.assert_shape(log_weighted_tail_power, (batch, n_proposals))
-    log_tail_power_mean = (jax.scipy.special.logsumexp(log_weighted_tail_power, axis=1)
-                           - jnp.log(n_proposals))
-    chex.assert_shape(log_tail_power_mean, (batch,))
-    weighted_tail_norm = jnp.where(
-        jnp.all(tail == 0.0, axis=1), 0.0, jnp.exp(log_tail_power_mean / config.tail_power))
-    chex.assert_shape(weighted_tail_norm, (batch,))
-    per_sample = eta + weighted_tail_norm / (1.0 - config.alpha)
-    chex.assert_shape(per_sample, (batch,))
-    objective = lambda_ * config.rho + jnp.mean(per_sample)
     chex.assert_shape(objective, ())
     return objective
