@@ -78,26 +78,28 @@ def lsv_market(variant: Literal["in_dist", "weak", "medium", "hard"], n_time: in
                         n_substeps=10, **LEVERAGE_PARAMS[variant])
 
 
-def _cache_file(cache_dir: Path, seed: int, tag: str, n_paths: int) -> Path:
-    """Build the cache filename for one (seed, tag, n_paths) dataset; inputs directory/seed/tag/n, output path."""
+def _cache_file(cache_dir: Path, seed: int, tag: str, n_paths: int, n_time: int) -> Path:
+    """Build the cache filename for one (seed, tag, n_paths, n_time) dataset; inputs directory/seed/tag/n/n_time, output path."""
 
-    return cache_dir / f"seed{seed}_{tag}_n{n_paths}.npz"
+    return cache_dir / f"seed{seed}_{tag}_n{n_paths}_t{n_time}.npz"
 
 
 def load_or_simulate(cache_dir: Path, seed: int, tag: str, market: MarketConfig, n_paths: int) -> Dataset:
     """Load a cached dataset or simulate and cache it; inputs cache location/config, output dataset triple.
 
-    The cache filename encodes n_paths, so a smoke test run with a small --n-test/--n-max cannot
-    silently be reused by a later full run with different sizes pointed at the same --cache-dir.
+    The cache filename encodes n_paths and n_time, so a smoke test run with a small --n-test/--n-max
+    or a different --n-time cannot silently be reused by a later run pointed at the same --cache-dir.
     """
 
-    path = _cache_file(cache_dir, seed, tag, n_paths)
+    path = _cache_file(cache_dir, seed, tag, n_paths, market.n_time)
     if path.exists():
         data = np.load(path)
         prices = jnp.asarray(data["prices"])
         features = jnp.asarray(data["features"])
         variance = jnp.asarray(data["variance"]) if "variance" in data else None
         assert prices.shape[0] == n_paths, f"cache {path} has {prices.shape[0]} paths, expected {n_paths}"
+        assert prices.shape[1] == market.n_time + 1, (
+            f"cache {path} has n_time {prices.shape[1] - 1}, expected {market.n_time}")
         return prices, features, variance
     key = jax.random.fold_in(jax.random.PRNGKey(seed), _TAG_OFFSETS[tag])
     prices, features, variance = simulate_market(key, market, n_paths)
